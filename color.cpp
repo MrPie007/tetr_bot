@@ -14,7 +14,7 @@ HDC hMemoryDC;
 BITMAPINFO bmi;
 HBITMAP hBitmap;
 
-int maxDepth=2;
+int maxDepth=1;
 int x = 785;      // top-left X
 int y = 180;      // top-left Y
 int width = 520;  // region width
@@ -601,22 +601,9 @@ int main() {
         }
 
         //1
-        cout<<cur<<":";
-        cout<<curPiece.type<<endl;
         array<int,3>best_play = getBestPos(curPiece,0);
         pushPiece(getLowestRow(best_play[0],best_play[1],curPiece),best_play[0],best_play[1],curPiece);
-        cout<<"score: "<<getScoreOfGrid()<<endl;
         
-        cout<<best_play[0]<<" "<<best_play[1]<<endl;
-        cur++;
-        for(int i=0;i<20;i++)
-        {
-            for(int j=0;j<10;j++)
-            {
-                cout<<grid[i][j]<<" ";
-            }
-            cout<<endl;
-        }
         
         
 

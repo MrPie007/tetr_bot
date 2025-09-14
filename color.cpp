@@ -7,10 +7,9 @@ using namespace std;
 /*
 TODO list:
 
-add rotations (top priority right now)
-
 fix the small clipping from the top of the grid (top 3 rows are not useable basically)
-
+more heuristics for the board eval
+brute force on more than one move ahead
 
 */
 HDC hScreenDC;
@@ -205,7 +204,7 @@ bool SaveBMP(const char* filename, void* pPixels, int width, int height) {
 //cell width is 35
 //cell height should be 35
 //cx/35 should be its index
-int grid[30][10];
+int grid[30][15];
 int cell_size=35;
 int grid_width=350,grid_height=700;
 //I will make 0th row the top row
@@ -302,44 +301,126 @@ void actuallyPutThePiece(int pos,int rotateCount)
     {
         pressKey(VK_UP);
         rotateCount--;
-        Sleep(50);
+        Sleep(70);
     }
     while(curPos>pos)
     {
         pressKey(VK_LEFT);
         curPos--;
-        Sleep(50);
+        Sleep(70);
     }
     while(curPos<pos)
     {
         pressKey(VK_RIGHT);
         curPos++;
-        Sleep(50);
+        Sleep(70);
     }
     pressKey(VK_SPACE);
-    Sleep(50);
+    Sleep(70);
 
 
 }
 
 ///SOME heuritics for score
+///Score will be penalty, goal is to minimize it
 //minimize stack height
 //minimize unsolvable holes
 //minimize stack height difference
 //minimize stairs
 //minimize dependencies (especially I's)
 //minimize holes
-
+///todo: give weight for each criteria (and actually implement them)
+int unsolvableCells[30][15];
 int getScoreOfGrid()
 {
-    return 0;
+    int maxHeight=0,mnHeight=20;
+    int numberOfHoles=0;
+    int firstInCol[10]={};
+    memset(unsolvableCells,0,sizeof(unsolvableCells));
+    for(int i=3;i<20;i++)
+    {
+        for(int j=0;j<10;j++)
+        {
+            if(!grid[i][j] && ((grid[i-1][j]) || unsolvableCells[i-1][j] || unsolvableCells[i][j+1]))
+            {
+                unsolvableCells[i][j]=1;
+                numberOfHoles++;
+            }
+            if(grid[i][j])
+            {
+                if(firstInCol[j]==0)firstInCol[j]=20-i;
+            }
+        }
+    }
+    //a hole is an I dep if 3 tall on both sides
+    //but if all I dep are in the same column then its fine
+
+    int isIDep[10]={};
+    int cntIDep=0;
+    for(int j=0;j<10;j++)
+    {
+        for(int i=6;i<20;i++)
+        {
+            for(int k=0;k<4;k++)
+            {
+                if((j==0 || grid[i-k][j-1]==1)&& (grid[i-k][j]==0) && grid[i-k][j+1]==1)
+                {
+                    isIDep[j]++;
+                    cntIDep+=(isIDep[j]>=3);
+                    if(isIDep[j]>=3)isIDep[j]=0;
+                }
+                else
+                {
+                    isIDep[j]=0;
+                }
+            }
+        }
+    }
+    //spikes..
+    int mx = *max_element(firstInCol,firstInCol+10);
+    int sm=0;
+    for(int j=0;j<10;j++)sm+=(mx-firstInCol[j])*(mx-firstInCol[j])*(mx-firstInCol[j]);
+
+    int score = sm+(cntIDep)*500 + numberOfHoles*9000;
+    return score;
 
 }
+void clear_all_grid()
+{
+    vector<int>rows;
+    for(int i=19;i>=0;i--)
+    {
+        int c=0;
+        for(int j=0;j<10;j++)c+=grid[i][j];
+        if(c<10)rows.push_back(i);
+        else
+        {
+            for(int j=0;j<10;j++)grid[i][j]=0;
+        }
+    }
+    int it=0;
+    int cpyrow=0;
+    for(int i=19;i>=0;i--)
+    {
+        if(it<rows.size())
+        {
+            for(int j=0;j<10;j++)grid[i][j]=grid[rows[it]][j];
+            it++;
+        }
+        else
+        {
+            for(int j=0;j<10;j++)grid[i][j]=0;
+        }
+    }
+
+}
+int tempGrid[25][15];
 pair<int,int> getBestPos(Piece p)
 {
-    int bestScore=10000;
+    int bestScore=10000000;
     int mnHeightInd=4;
     int mnHeighRot=0;
+    for(int i=0;i<21;i++)for(int j=0;j<=10;j++)tempGrid[i][j]=grid[i][j];
     for(int rot=0;rot<p.cells.size();rot++)
     {
         for(int j=0;j<10;j++)
@@ -348,6 +429,7 @@ pair<int,int> getBestPos(Piece p)
             if(x!=-1)
             {
                 pushPiece(x,j,rot,p);
+                clear_all_grid();
                 int curScore = getScoreOfGrid();
                 if(curScore<bestScore)
                 {
@@ -355,7 +437,7 @@ pair<int,int> getBestPos(Piece p)
                     mnHeightInd=j;
                     mnHeighRot=rot;
                 }
-                popPiece(x,j,rot,p);
+                for(int i=0;i<21;i++)for(int j=0;j<=10;j++)grid[i][j]=tempGrid[i][j];
             }
         }
     }
@@ -363,12 +445,18 @@ pair<int,int> getBestPos(Piece p)
     return {mnHeightInd,mnHeighRot};
 }
 int main() {
+    ios_base::sync_with_stdio(0);
+    cin.tie(0);
     init();
     //I will need to use the extra space at the top later, will implement as if I don't need it tho rn
     srand(2);
     for(int j=0;j<10;j++)
     {
         grid[20][j]=1;
+    }
+    for(int i=0;i<20;i++)
+    {
+        grid[i][10]=1;
     }
     if (!pPixels) {
         std::cerr << "Failed to create DIB section" << std::endl;
@@ -421,9 +509,17 @@ int main() {
         }
 
         //1
-        pair<int,int> best_play = getBestPos(curPiece);
-        
         cout<<cur<<":";
+        pair<int,int> best_play = getBestPos(curPiece);
+        for(int i=0;i<20;i++)
+        {
+            for(int j=0;j<10;j++)
+            {
+                cout<<grid[i][j]<<" ";
+            }
+            cout<<endl;
+        }
+        cout<<"score: "<<getScoreOfGrid()<<endl;
         cout<<best_play.first<<" "<<best_play.second<<endl;
         cur++;
         
@@ -442,7 +538,7 @@ int main() {
         curQueue=getQueue();        
 
         
-        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        std::this_thread::sleep_for(std::chrono::milliseconds(rand()%100+20));
     }
     
     DeleteObject(hBitmap);

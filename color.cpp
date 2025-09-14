@@ -36,7 +36,22 @@ Piece SPiece({196,250,136},{{{0,0},{-1,0},{0,-1},{1,-1}}},'S');
 Piece TPiece({231,135,211},{{{0,0},{-1,0},{1,0},{0,-1}}},'T');
 Piece all_p[7]={IPiece,JPiece,LPiece,OPiece,ZPiece,SPiece,TPiece};
 char all_pc[7]={'I','J','L','O','Z','S','T'};
+void pressKey(WORD keyCode) {
+    INPUT ip;
+    ip.type = INPUT_KEYBOARD;
+    ip.ki.wScan = 0;
+    ip.ki.time = 0;
+    ip.ki.dwExtraInfo = 0;
 
+    // Key press
+    ip.ki.wVk = keyCode;     
+    ip.ki.dwFlags = 0;      
+    SendInput(1, &ip, sizeof(INPUT));
+
+    // Key release
+    ip.ki.dwFlags = KEYEVENTF_KEYUP; 
+    SendInput(1, &ip, sizeof(INPUT));
+}
 
 void capture()
 {
@@ -185,7 +200,7 @@ int cell_size=35;
 int grid_width=350,grid_height=700;
 //I will make 0th row the top row
 //row 20 is the floor, it is always filled with 1s
-//for clarity
+//for clarityp
 //Pieces are defined by center piece, and positions of other pieces relative to it
 
 void load_grid()
@@ -276,6 +291,29 @@ void save_pic()
     SaveBMP(name.c_str(),pPixels,width,height);
     cout<<"SAVED"<<endl;
 }
+void actuallyPutThePiece(int pos,int rotateCount)
+{
+    //4 is the default position of all pieces
+    //TODO, implement the ability to rotate
+    //TODO, add the coordinates of rotated pieces for each piece
+    int curPos=4;
+    while(curPos>pos)
+    {
+        pressKey(VK_LEFT);
+        curPos--;
+        Sleep(50);
+    }
+    while(curPos<pos)
+    {
+        pressKey(VK_RIGHT);
+        curPos++;
+        Sleep(50);
+    }
+    pressKey(VK_SPACE);
+    Sleep(50);
+
+
+}
 int main() {
     init();
     //I will need to use the extra space at the top later, will implement as if I don't need it tho rn
@@ -306,64 +344,51 @@ int main() {
     save_pic();
     load_grid();
     vector<Piece>curQueue = getQueue();
-    //this is to get next piece from queue (put very first piece in first)
-    int cnt_cap=0;
-    while (cnt_cap<5) {
+    //I need to put a piece first before bot taking over
+    while (true) {
         if (GetAsyncKeyState(VK_SPACE) & 0x8000) {
             Sleep(400);
-            cnt_cap++;
-            cout<<"!!"<<cnt<<endl;
-            capture();    
-            load_grid();
-            save_pic();
-            Piece curPiece = curQueue[0];
-            vector<color>v = getQueueColors();
-            curQueue = getQueue();
-            cout<<curPiece.type<<endl;
-            for(int i=0;i<curQueue.size();i++)
-            {
-                cout<<curQueue[i].type<<" "<<v[i].R<<" "<<v[i].G<<" "<<v[i].B<<endl;
-            }
-            //break;
+            break;
         }
+        Sleep(50);
     }
-
-    /*capture();    
+    capture();    
     load_grid();
     save_pic();
     Piece curPiece = curQueue[0];
-    vector<color>v = getQueueColors();
     curQueue = getQueue();
-    cout<<curPiece.type<<endl;
-    for(int i=0;i<curQueue.size();i++)
-    {
-        cout<<curQueue[i].type<<" "<<v[i].R<<" "<<v[i].G<<" "<<v[i].B<<endl;
-    }*/
-
-    while (1) 
-    {   
-        break;
-        /*
+    /*
         Flow of logic should be something like
 
-        find best place for current state
-        put piece in that place
-        get new statep
+        1. find best place for current state
+        2. put piece in that place
+        3. get new statep
+    */
+    while (1) 
+    {   
+        //if I press P stop the bot (fail safe instead of ctrl c from terminal)
+        if (GetAsyncKeyState(0x50) & 0x8000) {
+            break;
+        }
+
+        //1
+        int best_pos = rand()%3+4;
 
 
-        */
+
+        //2
+        putPiece(best_pos,curPiece);
+        actuallyPutThePiece(best_pos,0);
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
 
-
-
-        end = std::chrono::high_resolution_clock::now();
-        duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-        milliseconds = duration_ms.count();
-        if(milliseconds>1000)break;
-        c++;
-        //std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        //3 (done)
+        capture();
+        load_grid();
+        curPiece=curQueue[0];
+        curQueue=getQueue();        
     }
-    cout<<"!"<<c<<endl;
     
     DeleteObject(hBitmap);
     DeleteDC(hMemoryDC);

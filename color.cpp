@@ -3,6 +3,16 @@
 #include <chrono>
 #include <thread>
 using namespace std;
+
+/*
+TODO list:
+
+add rotations (top priority right now)
+
+fix the small clipping from the top of the grid (top 3 rows are not useable basically)
+
+
+*/
 HDC hScreenDC;
 HDC hMemoryDC;
 BITMAPINFO bmi;
@@ -27,13 +37,13 @@ struct Piece{
 //handling rotations will suck so much
 //I can just assume they are new pieces basically
 //how do I get current piece??
-Piece IPiece({124,254,198},{{{-1,0},{0,0},{1,0},{2,0}}},'I');
-Piece JPiece({148,144,222},{{{0,0},{1,0},{-1,0},{-1,-1}}},'J');
-Piece LPiece({250,165,126},{{{0,0},{1,0},{-1,0},{1,-1}}},'L');
+Piece IPiece({124,254,198},{{{-1,0},{0,0},{1,0},{2,0}},{{1,1},{1,0},{1,-1},{1,-2}}},'I');
+Piece JPiece({148,144,222},{{{0,0},{1,0},{-1,0},{-1,-1}},{{0,0},{0,1},{0,-1},{1,-1}},{{0,0},{1,0},{-1,0},{1,1}},{{0,0},{-1,0},{0,-1},{0,-2}}},'J');
+Piece LPiece({250,165,126},{{{0,0},{1,0},{-1,0},{1,-1}},{{0,0},{1,0},{0,-1},{0,-2}},{{0,0},{1,0},{-1,0},{-1,1}},{{0,0},{0,1},{0,-1},{-1,-1}}},'L');
 Piece OPiece({255,227,130},{{{0,0},{1,0},{0,-1},{1,-1}}},'O');
-Piece ZPiece({252,137,143},{{{0,0},{1,0},{0,-1},{-1,-1}}},'Z');
-Piece SPiece({196,250,136},{{{0,0},{-1,0},{0,-1},{1,-1}}},'S');
-Piece TPiece({231,135,211},{{{0,0},{-1,0},{1,0},{0,-1}}},'T');
+Piece ZPiece({252,137,143},{{{0,0},{1,0},{0,-1},{-1,-1}},{{0,0},{1,0},{0,1},{1,-1}}},'Z');
+Piece SPiece({196,250,136},{{{0,0},{-1,0},{0,-1},{1,-1}},{{0,0},{0,-1},{1,0},{1,1}}},'S');
+Piece TPiece({231,135,211},{{{0,0},{-1,0},{1,0},{0,-1}},{{0,0},{0,1},{0,-1},{1,0}},{{0,0},{-1,0},{1,0},{0,1}},{{0,0},{0,1},{0,-1},{-1,0}}},'T');
 Piece all_p[7]={IPiece,JPiece,LPiece,OPiece,ZPiece,SPiece,TPiece};
 char all_pc[7]={'I','J','L','O','Z','S','T'};
 void pressKey(WORD keyCode) {
@@ -221,38 +231,38 @@ void load_grid()
         }
     }
 }
-void popPiece(int i,int j, Piece p)
+void popPiece(int i,int j,int rot, Piece p)
 {
-    for(int k=0;k<p.cells[0].size();k++)
+    for(int k=0;k<p.cells[rot].size();k++)
     {
-        int ni = i+p.cells[0][k].second;
-        int nj = j+p.cells[0][k].first;
+        int ni = i+p.cells[rot][k].second;
+        int nj = j+p.cells[rot][k].first;
         grid[ni][nj]=0;
     }
 }
-void pushPiece(int i,int j, Piece p)
+void pushPiece(int i,int j,int rot, Piece p)
 {
-    for(int k=0;k<p.cells[0].size();k++)
+    for(int k=0;k<p.cells[rot].size();k++)
     {
-        int ni = i+p.cells[0][k].second;
-        int nj = j+p.cells[0][k].first;
+        int ni = i+p.cells[rot][k].second;
+        int nj = j+p.cells[rot][k].first;
         grid[ni][nj]=1;
     }
 }
-int getLowestRow(int j, Piece p)
+int getLowestRow(int j, int rot, Piece p)
 {
     //j is the position for the "core" of the piece
     //I need to put it as down as possible
     int to_put=-1;
     ///HERE I also reduce space from top of grid..
     //this should be really optimizable
-    for(int i=3;i<=20;i++)
+    for(int i=5;i<=20;i++)
     {
         bool valid=1;
-        for(int k=0;k<p.cells[0].size();k++)
+        for(int k=0;k<p.cells[rot].size();k++)
         {
-            int ni = i+p.cells[0][k].second;
-            int nj = j+p.cells[0][k].first;
+            int ni = i+p.cells[rot][k].second;
+            int nj = j+p.cells[rot][k].first;
             if(ni>=20 || ni<0 || nj>=10 || nj<0 || grid[ni][nj]==1)
             {
                 valid=0;
@@ -288,6 +298,12 @@ void actuallyPutThePiece(int pos,int rotateCount)
     //TODO, implement the ability to rotate
     //TODO, add the coordinates of rotated pieces for each piece
     int curPos=4;
+    while(rotateCount>0)
+    {
+        pressKey(VK_UP);
+        rotateCount--;
+        Sleep(50);
+    }
     while(curPos>pos)
     {
         pressKey(VK_LEFT);
@@ -305,38 +321,46 @@ void actuallyPutThePiece(int pos,int rotateCount)
 
 
 }
-int getGridHeight()
+
+///SOME heuritics for score
+//minimize stack height
+//minimize unsolvable holes
+//minimize stack height difference
+//minimize stairs
+//minimize dependencies (especially I's)
+//minimize holes
+
+int getScoreOfGrid()
 {
-    for(int i=0;i<=20;i++)
+    return 0;
+
+}
+pair<int,int> getBestPos(Piece p)
+{
+    int bestScore=10000;
+    int mnHeightInd=4;
+    int mnHeighRot=0;
+    for(int rot=0;rot<p.cells.size();rot++)
     {
         for(int j=0;j<10;j++)
         {
-            if(grid[i][j])return 20-i;
-        }
-    }
-    return -1;
-}
-//Small heuristic of minimizing the max height
-int getBestPos(Piece p)
-{
-    int mnHeight=25;
-    int mnHeightInd=4;
-    for(int j=0;j<10;j++)
-    {
-        int x=getLowestRow(j,p);
-        if(x!=-1)
-        {
-            pushPiece(x,j,p);
-            int curHeight = getGridHeight();
-            if(curHeight<mnHeight)
+            int x=getLowestRow(j,rot,p);
+            if(x!=-1)
             {
-                mnHeight=curHeight;
-                mnHeightInd=j;
+                pushPiece(x,j,rot,p);
+                int curScore = getScoreOfGrid();
+                if(curScore<bestScore)
+                {
+                    bestScore=curScore;
+                    mnHeightInd=j;
+                    mnHeighRot=rot;
+                }
+                popPiece(x,j,rot,p);
             }
-            popPiece(x,j,p);
         }
     }
-    return mnHeightInd;
+    
+    return {mnHeightInd,mnHeighRot};
 }
 int main() {
     init();
@@ -388,6 +412,7 @@ int main() {
         2. put piece in that place
         3. get new statep
     */
+    int cur=1;
     while (1) 
     {   
         //if I press P stop the bot (fail safe instead of ctrl c from terminal)
@@ -396,14 +421,18 @@ int main() {
         }
 
         //1
-        int best_pos = getBestPos(curPiece);
+        pair<int,int> best_play = getBestPos(curPiece);
+        
+        cout<<cur<<":";
+        cout<<best_play.first<<" "<<best_play.second<<endl;
+        cur++;
+        
 
 
 
         //2
-        actuallyPutThePiece(best_pos,0);
+        actuallyPutThePiece(best_play.first,best_play.second);
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
 
         //3 (done)
@@ -411,6 +440,9 @@ int main() {
         load_grid();
         curPiece=curQueue[0];
         curQueue=getQueue();        
+
+        
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));
     }
     
     DeleteObject(hBitmap);

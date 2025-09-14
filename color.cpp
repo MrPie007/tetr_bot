@@ -6,11 +6,8 @@ using namespace std;
 
 /*
 TODO list:
-
-fix the small clipping from the top of the grid (top 3 rows are not useable basically)
-more heuristics for the board eval
-brute force on more than one move ahead
-
+~~more~~ fix heuristics for the board eval
+brute force on more than one move ahead (iterative deepining)
 */
 HDC hScreenDC;
 HDC hMemoryDC;
@@ -219,7 +216,7 @@ void load_grid()
         for(int j=15;j<grid_height;j+=cell_size)
         {
             color cur = getMaxInRegion(i,j,i+2,j+2);
-            if(cur.R>70 || cur.G>70 || cur.B>70)
+            if(cur.R>34 || cur.G>34 || cur.B>34)
             {
                 grid[j/cell_size][i/cell_size] = 1;
             }
@@ -241,10 +238,12 @@ void popPiece(int i,int j,int rot, Piece p)
 }
 void pushPiece(int i,int j,int rot, Piece p)
 {
+    
     for(int k=0;k<p.cells[rot].size();k++)
     {
         int ni = i+p.cells[rot][k].second;
         int nj = j+p.cells[rot][k].first;
+        assert(ni>=0 && ni<20 && nj>=0 && nj<10 && grid[ni][nj]==0);
         grid[ni][nj]=1;
     }
 }
@@ -255,7 +254,7 @@ int getLowestRow(int j, int rot, Piece p)
     int to_put=-1;
     ///HERE I also reduce space from top of grid..
     //this should be really optimizable
-    for(int i=5;i<=20;i++)
+    for(int i=2;i<=20;i++)
     {
         bool valid=1;
         for(int k=0;k<p.cells[rot].size();k++)
@@ -301,22 +300,22 @@ void actuallyPutThePiece(int pos,int rotateCount)
     {
         pressKey(VK_UP);
         rotateCount--;
-        Sleep(70);
+        Sleep(40);
     }
     while(curPos>pos)
     {
         pressKey(VK_LEFT);
         curPos--;
-        Sleep(70);
+        Sleep(40);
     }
     while(curPos<pos)
     {
         pressKey(VK_RIGHT);
         curPos++;
-        Sleep(70);
+        Sleep(40);
     }
     pressKey(VK_SPACE);
-    Sleep(70);
+    Sleep(40);
 
 
 }
@@ -337,7 +336,8 @@ int getScoreOfGrid()
     int numberOfHoles=0;
     int firstInCol[10]={};
     memset(unsolvableCells,0,sizeof(unsolvableCells));
-    for(int i=3;i<20;i++)
+    int aboveHoles=0;
+    for(int i=2;i<20;i++)
     {
         for(int j=0;j<10;j++)
         {
@@ -349,6 +349,17 @@ int getScoreOfGrid()
             if(grid[i][j])
             {
                 if(firstInCol[j]==0)firstInCol[j]=20-i;
+            }
+        }
+    }
+    
+    for(int i=18;i>=0;i--)
+    {
+        for(int j=0;j<10;j++){
+            if(grid[i][j] && unsolvableCells[i+1][j])
+            {
+                unsolvableCells[i][j]=1;
+                aboveHoles++;
             }
         }
     }
@@ -378,15 +389,17 @@ int getScoreOfGrid()
     }
     //spikes..
     int mx = *max_element(firstInCol,firstInCol+10);
+    int mn = *min_element(firstInCol,firstInCol+10);
+    for(int i=0;i<10;i++)firstInCol[i]-=mn;
     int sm=0;
-    for(int j=0;j<10;j++)sm+=(mx-firstInCol[j])*(mx-firstInCol[j])*(mx-firstInCol[j]);
-
-    int score = sm+(cntIDep)*500 + numberOfHoles*9000;
+    for(int j=0;j<10;j++)sm+=(firstInCol[j] * (max(1,firstInCol[j]-3)));
+    int score = sm+(cntIDep)*10 + numberOfHoles*100 + aboveHoles + mx;
     return score;
 
 }
-void clear_all_grid()
+int clear_all_grid()
 {
+    int ret=0;
     vector<int>rows;
     for(int i=19;i>=0;i--)
     {
@@ -395,6 +408,7 @@ void clear_all_grid()
         if(c<10)rows.push_back(i);
         else
         {
+            ret++;
             for(int j=0;j<10;j++)grid[i][j]=0;
         }
     }
@@ -412,44 +426,73 @@ void clear_all_grid()
             for(int j=0;j<10;j++)grid[i][j]=0;
         }
     }
+    return ret;
 
 }
 int tempGrid[25][15];
+/*
+0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0
+0 0 0 0 0 0 0 0 0 0
+0 0 0 1 0 0 0 1 1 0
+1 1 1 1 1 0 0 1 1 1
+1 1 1 1 1 1 1 1 1 1
+1 1 1 1 1 1 1 1 1 0
+1 1 1 1 1 1 1 1 1 0
+1 1 1 1 1 1 1 1 1 0
+1 1 1 1 1 1 1 0 1 1
+1 1 1 1 1 1 1 0 1 1
+1 1 1 1 1 1 1 0 1 1
+1 1 1 1 1 1 1 0 1 1
+1 1 1 1 1 1 1 0 1 1
+1 1 1 1 1 1 1 0 1 1
+1 1 1 1 1 1 1 0 1 1
+1 1 1 1 1 1 1 0 1 1
+1 1 1 1 1 1 1 0 1 1
+1 1 1 1 1 1 1 0 1 1
+
+*/
+void saveGrid()
+{
+    for(int i=0;i<21;i++)for(int j=0;j<=10;j++)tempGrid[i][j]=grid[i][j];
+}
+void resetGrid()
+{
+    for(int i=0;i<21;i++)for(int j=0;j<=10;j++)grid[i][j]=tempGrid[i][j];
+}
 pair<int,int> getBestPos(Piece p)
 {
     int bestScore=10000000;
     int mnHeightInd=4;
     int mnHeighRot=0;
-    for(int i=0;i<21;i++)for(int j=0;j<=10;j++)tempGrid[i][j]=grid[i][j];
+    saveGrid();
     for(int rot=0;rot<p.cells.size();rot++)
     {
-        for(int j=0;j<10;j++)
+        for(int j=-1;j<10;j++)
         {
             int x=getLowestRow(j,rot,p);
             if(x!=-1)
             {
                 pushPiece(x,j,rot,p);
-                clear_all_grid();
-                int curScore = getScoreOfGrid();
+                //this is awkward, I should be putting this inside the scoring function
+                int cst=clear_all_grid();
+                int curScore = getScoreOfGrid() + -10*cst*cst*cst;
                 if(curScore<bestScore)
                 {
                     bestScore=curScore;
                     mnHeightInd=j;
                     mnHeighRot=rot;
                 }
-                for(int i=0;i<21;i++)for(int j=0;j<=10;j++)grid[i][j]=tempGrid[i][j];
+                resetGrid();
             }
         }
     }
-    
     return {mnHeightInd,mnHeighRot};
 }
 int main() {
     ios_base::sync_with_stdio(0);
     cin.tie(0);
-    init();
-    //I will need to use the extra space at the top later, will implement as if I don't need it tho rn
-    srand(2);
     for(int j=0;j<10;j++)
     {
         grid[20][j]=1;
@@ -458,11 +501,41 @@ int main() {
     {
         grid[i][10]=1;
     }
+    /*for(int i=0;i<20;i++)
+    {
+        for(int j=0;j<10;j++)
+        {
+            cin>>grid[i][j];
+        }
+    }*/
+    /*cout<<getScoreOfGrid()<<endl;
+    cout<<endl<<endl;
+    saveGrid();
+    for(int j=4;j<6;j++)
+    {
+        for(int rot=0;rot<1;rot++){
+            cout<<j<<" "<<rot<<":";
+            if(getLowestRow(j,rot,ZPiece)==-1)continue;
+            pushPiece(getLowestRow(j,rot,ZPiece),j,rot,ZPiece);
+            for(int i=0;i<20;i++)
+            {
+                for(int j=0;j<10;j++)cout<<grid[i][j]<<" ";
+                cout<<endl;
+            }
+            cout<<getScoreOfGrid()<<endl;
+            resetGrid();
+        }
+    }
+    return 0;*/
+    init();
+    //I will need to use the extra space at the top later, will implement as if I don't need it tho rn
+    srand(2);
+    
     if (!pPixels) {
         std::cerr << "Failed to create DIB section" << std::endl;
         return -1;
     }
-    
+    cout<<"HI"<<endl;
     double milliseconds = 0;
     auto start = std::chrono::high_resolution_clock::now();
     auto end = std::chrono::high_resolution_clock::now();
@@ -471,7 +544,8 @@ int main() {
     //This is for starting the game
     while (true) {
         if (GetAsyncKeyState(0x50) & 0x8000) {
-            cout<<"Starting game..";
+            cout<<"Starting game.."<<endl;;
+            cout.flush();
             break;
         }
         Sleep(50); // small delay so CPU isn't 100% busy
@@ -510,7 +584,13 @@ int main() {
 
         //1
         cout<<cur<<":";
+        cout<<curPiece.type<<endl;
         pair<int,int> best_play = getBestPos(curPiece);
+        pushPiece(getLowestRow(best_play.first,best_play.second,curPiece),best_play.first,best_play.second,curPiece);
+        cout<<"score: "<<getScoreOfGrid()<<endl;
+        
+        cout<<best_play.first<<" "<<best_play.second<<endl;
+        cur++;
         for(int i=0;i<20;i++)
         {
             for(int j=0;j<10;j++)
@@ -519,9 +599,7 @@ int main() {
             }
             cout<<endl;
         }
-        cout<<"score: "<<getScoreOfGrid()<<endl;
-        cout<<best_play.first<<" "<<best_play.second<<endl;
-        cur++;
+        
         
 
 
@@ -538,7 +616,7 @@ int main() {
         curQueue=getQueue();        
 
         
-        std::this_thread::sleep_for(std::chrono::milliseconds(rand()%100+20));
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
     
     DeleteObject(hBitmap);

@@ -221,7 +221,25 @@ void load_grid()
         }
     }
 }
-int putPiece(int j, Piece p)
+void popPiece(int i,int j, Piece p)
+{
+    for(int k=0;k<p.cells[0].size();k++)
+    {
+        int ni = i+p.cells[0][k].second;
+        int nj = j+p.cells[0][k].first;
+        grid[ni][nj]=0;
+    }
+}
+void pushPiece(int i,int j, Piece p)
+{
+    for(int k=0;k<p.cells[0].size();k++)
+    {
+        int ni = i+p.cells[0][k].second;
+        int nj = j+p.cells[0][k].first;
+        grid[ni][nj]=1;
+    }
+}
+int getLowestRow(int j, Piece p)
 {
     //j is the position for the "core" of the piece
     //I need to put it as down as possible
@@ -257,33 +275,6 @@ int putPiece(int j, Piece p)
 //I,Z,S have two rotations
 //(although they act differently)
 //J,L,T have 4 rotations
-void debug_Grid_And_Pieces()
-{
-    for(int i=17;i<=20;i++)
-    {
-        for(int j=0;j<10;j++)
-        {
-            grid[i][j]=rand()%2;
-        }
-
-    }
-    for(int i=0;i<20;i++)
-    {
-        for(int j=0;j<10;j++)
-        {
-            cout<<grid[i][j]<<" ";
-        }
-        cout<<endl;
-    }
-    
-
-    for(int i=0;i<7;i++)
-    {
-        cout<<all_pc[i]<<" ";
-        for(int j=0;j<10;j++)cout<<putPiece(j,all_p[i])<<" ";
-        cout<<endl;
-    }
-}
 int cnt=0;
 void save_pic()
 {
@@ -313,6 +304,39 @@ void actuallyPutThePiece(int pos,int rotateCount)
     Sleep(50);
 
 
+}
+int getGridHeight()
+{
+    for(int i=0;i<=20;i++)
+    {
+        for(int j=0;j<10;j++)
+        {
+            if(grid[i][j])return 20-i;
+        }
+    }
+    return -1;
+}
+//Small heuristic of minimizing the max height
+int getBestPos(Piece p)
+{
+    int mnHeight=25;
+    int mnHeightInd=4;
+    for(int j=0;j<10;j++)
+    {
+        int x=getLowestRow(j,p);
+        if(x!=-1)
+        {
+            pushPiece(x,j,p);
+            int curHeight = getGridHeight();
+            if(curHeight<mnHeight)
+            {
+                mnHeight=curHeight;
+                mnHeightInd=j;
+            }
+            popPiece(x,j,p);
+        }
+    }
+    return mnHeightInd;
 }
 int main() {
     init();
@@ -372,12 +396,11 @@ int main() {
         }
 
         //1
-        int best_pos = rand()%3+4;
+        int best_pos = getBestPos(curPiece);
 
 
 
         //2
-        putPiece(best_pos,curPiece);
         actuallyPutThePiece(best_pos,0);
 
         std::this_thread::sleep_for(std::chrono::milliseconds(200));

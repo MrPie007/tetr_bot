@@ -13,6 +13,8 @@ HDC hScreenDC;
 HDC hMemoryDC;
 BITMAPINFO bmi;
 HBITMAP hBitmap;
+
+int maxDepth=2;
 int x = 785;      // top-left X
 int y = 180;      // top-left Y
 int width = 520;  // region width
@@ -30,6 +32,11 @@ struct Piece{
     char type;
     Piece(color c,vector<vector<pair<int,int>>>cells,char type):c(c),cells(cells),type(type){}
 };
+vector<Piece>curQueue;
+vector<vector<int>>grid;
+vector<vector<int>>tempGrid;
+int cell_size=35;
+int grid_width=350,grid_height=700;
 //handling rotations will suck so much
 //I can just assume they are new pieces basically
 //how do I get current piece??
@@ -201,9 +208,7 @@ bool SaveBMP(const char* filename, void* pPixels, int width, int height) {
 //cell width is 35
 //cell height should be 35
 //cx/35 should be its index
-int grid[30][15];
-int cell_size=35;
-int grid_width=350,grid_height=700;
+
 //I will make 0th row the top row
 //row 20 is the floor, it is always filled with 1s
 //for clarityp
@@ -393,7 +398,7 @@ int getScoreOfGrid()
     for(int i=0;i<10;i++)firstInCol[i]-=mn;
     int sm=0;
     for(int j=0;j<10;j++)sm+=(firstInCol[j] * (max(1,firstInCol[j]-3)));
-    int score = sm+(cntIDep)*10 + numberOfHoles*100 + aboveHoles + mx;
+    int score = sm+cntIDep*cntIDep*5 + numberOfHoles*150 + aboveHoles*10 + mx*5;
     return score;
 
 }
@@ -429,7 +434,6 @@ int clear_all_grid()
     return ret;
 
 }
-int tempGrid[25][15];
 /*
 0 0 0 0 0 0 0 0 0 0
 0 0 0 0 0 0 0 0 0 0
@@ -453,17 +457,27 @@ int tempGrid[25][15];
 1 1 1 1 1 1 1 0 1 1
 
 */
+stack<vector<vector<int>>>grids;
 void saveGrid()
 {
-    for(int i=0;i<21;i++)for(int j=0;j<=10;j++)tempGrid[i][j]=grid[i][j];
+    grids.push(grid);
 }
 void resetGrid()
 {
-    for(int i=0;i<21;i++)for(int j=0;j<=10;j++)grid[i][j]=tempGrid[i][j];
+    grid=grids.top();
 }
-pair<int,int> getBestPos(Piece p)
+void unsaveGrid()
+{
+    grids.pop();
+}
+array<int,3> getBestPos(Piece p,int curDepth)
 {
     int bestScore=10000000;
+    array<int,3>ret={0,0,0};
+    if(curDepth>maxDepth)
+    {
+        return {0,0,getScoreOfGrid()};
+    }
     int mnHeightInd=4;
     int mnHeighRot=0;
     saveGrid();
@@ -477,7 +491,8 @@ pair<int,int> getBestPos(Piece p)
                 pushPiece(x,j,rot,p);
                 //this is awkward, I should be putting this inside the scoring function
                 int cst=clear_all_grid();
-                int curScore = getScoreOfGrid() + -10*cst*cst*cst;
+                array<int,3>cur=getBestPos(curQueue[curDepth],curDepth+1);
+                int curScore = cur[2] + -10*cst*cst*cst;
                 if(curScore<bestScore)
                 {
                     bestScore=curScore;
@@ -488,11 +503,14 @@ pair<int,int> getBestPos(Piece p)
             }
         }
     }
-    return {mnHeightInd,mnHeighRot};
+    unsaveGrid();
+    return {mnHeightInd,mnHeighRot,bestScore};
 }
 int main() {
     ios_base::sync_with_stdio(0);
     cin.tie(0);
+    vector<int>zeros(11,0);
+    for(int i=0;i<21;i++)grid.push_back(zeros);
     for(int j=0;j<10;j++)
     {
         grid[20][j]=1;
@@ -553,7 +571,7 @@ int main() {
     capture(); 
     save_pic();
     load_grid();
-    vector<Piece>curQueue = getQueue();
+    curQueue = getQueue();
     //I need to put a piece first before bot taking over
     while (true) {
         if (GetAsyncKeyState(VK_SPACE) & 0x8000) {
@@ -585,11 +603,11 @@ int main() {
         //1
         cout<<cur<<":";
         cout<<curPiece.type<<endl;
-        pair<int,int> best_play = getBestPos(curPiece);
-        pushPiece(getLowestRow(best_play.first,best_play.second,curPiece),best_play.first,best_play.second,curPiece);
+        array<int,3>best_play = getBestPos(curPiece,0);
+        pushPiece(getLowestRow(best_play[0],best_play[1],curPiece),best_play[0],best_play[1],curPiece);
         cout<<"score: "<<getScoreOfGrid()<<endl;
         
-        cout<<best_play.first<<" "<<best_play.second<<endl;
+        cout<<best_play[0]<<" "<<best_play[1]<<endl;
         cur++;
         for(int i=0;i<20;i++)
         {
@@ -605,7 +623,7 @@ int main() {
 
 
         //2
-        actuallyPutThePiece(best_play.first,best_play.second);
+        actuallyPutThePiece(best_play[0],best_play[1]);
 
 
 

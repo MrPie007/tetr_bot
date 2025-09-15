@@ -6,6 +6,11 @@ using namespace std;
 
 /*
 TODO list:
+runtime optimization ideas:
+represent board as a bitset, do all operations using bitwise operations
+
+
+
 ~~more~~ fix heuristics for the board eval
 brute force on more than one move ahead (iterative deepining)
 
@@ -45,8 +50,8 @@ int grid_width=350,grid_height=700;
 //handling rotations will suck so much
 //I can just assume they are new pieces basically
 Piece IPiece({124,254,198},{{{-1,0},{0,0},{1,0},{2,0}},{{1,1},{1,0},{1,-1},{1,-2}}},'I');
-Piece JPiece({148,144,222},{{{0,0},{1,0},{-1,0},{-1,-1}},{{0,0},{0,1},{0,-1},{1,-1}},{{0,0},{1,0},{-1,0},{1,1}},{{0,0},{-1,0},{0,-1},{0,-2}}},'J');
-Piece LPiece({250,165,126},{{{0,0},{1,0},{-1,0},{1,-1}},{{0,0},{1,0},{0,-1},{0,-2}},{{0,0},{1,0},{-1,0},{-1,1}},{{0,0},{0,1},{0,-1},{-1,-1}}},'L');
+Piece JPiece({148,144,222},{{{0,0},{1,0},{-1,0},{-1,-1}},{{0,0},{0,1},{0,-1},{1,-1}},{{1,1},{0,0},{1,0},{-1,0}},{{0,0},{-1,0},{0,-1},{0,-2}}},'J');
+Piece LPiece({250,165,126},{{{0,0},{1,0},{-1,0},{1,-1}},{{0,0},{1,0},{0,-1},{0,-2}},{{0,0},{1,0},{-1,0},{-1,1}},{{0,1},{0,0},{0,-1},{-1,-1}}},'L');
 Piece OPiece({255,227,130},{{{0,0},{1,0},{0,-1},{1,-1}}},'O');
 Piece ZPiece({252,137,143},{{{0,0},{1,0},{0,-1},{-1,-1}},{{0,0},{1,0},{0,1},{1,-1}}},'Z');
 Piece SPiece({196,250,136},{{{0,0},{-1,0},{0,-1},{1,-1}},{{0,0},{0,-1},{1,0},{1,1}}},'S');
@@ -299,32 +304,45 @@ void save_pic()
     SaveBMP(name.c_str(),pPixels,width,height);
     cout<<"SAVED"<<endl;
 }
+int delayPress=10;
 void actuallyPutThePiece(int pos,int rotateCount)
 {
     //4 is the default position of all pieces
     //TODO, implement the ability to rotate
     //TODO, add the coordinates of rotated pieces for each piece
     int curPos=4;
+    if(rotateCount == 3)
+    {
+        pressKey('Z');
+        rotateCount=0;
+        Sleep(delayPress);
+    }
+    if(rotateCount == 2)
+    {
+        pressKey('A');
+        rotateCount=0;
+        Sleep(delayPress);
+    }
     while(rotateCount>0)
     {
         pressKey(VK_UP);
         rotateCount--;
-        Sleep(20);
+        Sleep(delayPress);
     }
     while(curPos>pos)
     {
         pressKey(VK_LEFT);
         curPos--;
-        Sleep(20);
+        Sleep(delayPress);
     }
     while(curPos<pos)
     {
         pressKey(VK_RIGHT);
         curPos++;
-        Sleep(20);
+        Sleep(delayPress);
     }
     pressKey(VK_SPACE);
-    Sleep(40);
+    Sleep(delayPress);
 
 
 }
@@ -339,28 +357,42 @@ void actuallyPutThePiece(int pos,int rotateCount)
 //minimize holes
 ///todo: give weight for each criteria (and actually implement them)
 int unsolvableCells[30][15];
+
+//TODO: optimize this
+
+int isIDep[10];
+int firstInCol[10];
+bool debugScore=0;
 int getScoreOfGrid()
 {
-    int maxHeight=0,mnHeight=20;
+    int mx=0,mn=-1;
     int numberOfHoles=0;
-    int firstInCol[10]={};
     memset(unsolvableCells,0,sizeof(unsolvableCells));
+    memset(firstInCol,0,sizeof(firstInCol));
+    memset(isIDep,0,sizeof(isIDep));
     int aboveHoles=0;
     for(int i=2;i<20;i++)
     {
         for(int j=0;j<10;j++)
         {
-            if(!grid[i][j] && ((grid[i-1][j]) || unsolvableCells[i-1][j] || unsolvableCells[i][j+1]))
+            //remember that you removed the right side unsolvable check
+            if(!grid[i][j] && ((grid[i-1][j]) || unsolvableCells[i-1][j]))
             {
                 unsolvableCells[i][j]=1;
                 numberOfHoles++;
             }
             if(grid[i][j])
             {
-                if(firstInCol[j]==0)firstInCol[j]=20-i;
+                if(firstInCol[j]==0){
+                    firstInCol[j]=20-i;
+                }
             }
+            mx=max(mx,firstInCol[j]);
+            
+            if(i==19 && (mn == -1 || firstInCol[j]<mn))mn=firstInCol[j];
         }
     }
+    mn=max(mn,0);
     
     for(int i=18;i>=0;i--)
     {
@@ -375,10 +407,13 @@ int getScoreOfGrid()
     //a hole is an I dep if 3 tall on both sides
     //but if all I dep are in the same column then its fine
 
-    int isIDep[10]={};
     int cntIDep=0;
+    
+    int sm=0;
     for(int j=0;j<10;j++)
     {
+        firstInCol[j]-=mn;
+        sm+=(firstInCol[j] * (max(1,firstInCol[j]-10)));
         for(int i=6;i<20;i++)
         {
             for(int k=0;k<4;k++)
@@ -392,19 +427,21 @@ int getScoreOfGrid()
                 else
                 {
                     isIDep[j]=0;
+                    break;
                 }
             }
         }
     }
     //spikes..
-    int mx = *max_element(firstInCol,firstInCol+10);
-    int mn = *min_element(firstInCol,firstInCol+10);
-    for(int i=0;i<10;i++)firstInCol[i]-=mn;
-    int sm=0;
-    for(int j=0;j<10;j++)sm+=(firstInCol[j] * (max(1,firstInCol[j]-3)));
-    int score = sm+cntIDep*cntIDep*5 + numberOfHoles*150 + aboveHoles*10 + mx*5;
+    if(debugScore){
+        cout<<cntIDep<<" "<<numberOfHoles<<" "<<aboveHoles<<" "<<mx<<" "<<sm<<" "<<mn<<endl;
+        for(int j=0;j<10;j++)cout<<firstInCol[j]<<" ";
+        cout<<endl;
+    }
+    int score = sm+cntIDep*cntIDep*2 + numberOfHoles*200 + aboveHoles*3 + mx*mx;
     return score;
 }
+//TODO: somehow optmize this
 int clear_all_grid()
 {
     int ret=0;
@@ -437,29 +474,7 @@ int clear_all_grid()
     return ret;
 
 }
-/*
-0 0 0 0 0 0 0 0 0 0
-0 0 0 0 0 0 0 0 0 0
-0 0 0 0 0 0 0 0 0 0
-0 0 0 0 0 0 0 0 0 0
-0 0 0 1 0 0 0 1 1 0
-1 1 1 1 1 0 0 1 1 1
-1 1 1 1 1 1 1 1 1 1
-1 1 1 1 1 1 1 1 1 0
-1 1 1 1 1 1 1 1 1 0
-1 1 1 1 1 1 1 1 1 0
-1 1 1 1 1 1 1 0 1 1
-1 1 1 1 1 1 1 0 1 1
-1 1 1 1 1 1 1 0 1 1
-1 1 1 1 1 1 1 0 1 1
-1 1 1 1 1 1 1 0 1 1
-1 1 1 1 1 1 1 0 1 1
-1 1 1 1 1 1 1 0 1 1
-1 1 1 1 1 1 1 0 1 1
-1 1 1 1 1 1 1 0 1 1
-1 1 1 1 1 1 1 0 1 1
 
-*/
 stack<vector<vector<int>>>grids;
 void saveGrid()
 {
@@ -473,17 +488,9 @@ void unsaveGrid()
 {
     grids.pop();
 }
-array<int,3> getBestPos(Piece p,int curDepth)
+vector<pair<int,int>>getMoves(Piece &p)
 {
-    int bestScore=10000000;
-    array<int,3>ret={0,0,0};
-    if(curDepth>maxDepth)
-    {
-        return {0,0,getScoreOfGrid()};
-    }
-    int mnHeightInd=4;
-    int mnHeighRot=0;
-    saveGrid();
+    vector<pair<int,int>>ret;
     for(int rot=0;rot<p.cells.size();rot++)
     {
         for(int j=-1;j<10;j++)
@@ -491,23 +498,76 @@ array<int,3> getBestPos(Piece p,int curDepth)
             int x=getLowestRow(j,rot,p);
             if(x!=-1)
             {
-                pushPiece(x,j,rot,p);
-                //this is awkward, I should be putting this inside the scoring function
-                int cst=clear_all_grid();
-                array<int,3>cur=getBestPos(curQueue[curDepth],curDepth+1);
-                int curScore = cur[2] + -10*cst*cst*cst;
-                if(curScore<bestScore)
-                {
-                    bestScore=curScore;
-                    mnHeightInd=j;
-                    mnHeighRot=rot;
-                }
-                resetGrid();
+                ret.push_back({j,rot});
             }
+        }
+    }
+    return ret;
+}
+vector<array<int,3>>retV;
+array<int,3> getBestPos(Piece &p,int curDepth)
+{
+    if(curDepth>maxDepth)
+    {
+        return {0,0,getScoreOfGrid()};
+    }
+    int bestScore=10000000;
+    int mnHeightInd=4;
+    int mnHeighRot=0;
+    saveGrid();
+    vector<pair<int,int>>moves = getMoves(p);
+     
+    for(int i=0;i<moves.size();i++)
+    {
+        int j=moves[i].first;
+        int rot=moves[i].second;
+        int x=getLowestRow(j,rot,p);
+        if(x!=-1)
+        {
+            pushPiece(x,j,rot,p);
+            //this is awkward, I should be putting this inside the scoring function
+            int cst=clear_all_grid();
+            array<int,3>cur=getBestPos(curQueue[curDepth],curDepth+1);
+            int curScore = cur[2] + -10*cst*cst*cst*cst;
+            if(curDepth == 1)
+            {
+                retV.push_back({j,rot,curScore});
+            }
+            if(curScore<bestScore)
+            {
+                bestScore=curScore;
+                mnHeightInd=j;
+                mnHeighRot=rot;
+            }
+            resetGrid();
         }
     }
     unsaveGrid();
     return {mnHeightInd,mnHeighRot,bestScore};
+}
+bool cmp(array<int,3>&a,array<int,3>&b)
+{
+    if(a[2]==b[2]){
+        if(a[1]==b[1])return a[0]<b[0];
+        return a[1]<b[1];
+    }
+    return a[2]<b[2];
+}
+array<int,3> getBestPosIterative(Piece p)
+{
+    array<int,3>best = {0,0,(int)1e9};
+    array<int,3>cur;
+    for(maxDepth=2;maxDepth<=2;maxDepth++)
+    {
+        retV.clear();
+        auto start = std::chrono::high_resolution_clock::now();
+        cur=getBestPos(p,1);
+        auto end = std::chrono::high_resolution_clock::now();
+        auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+        cout<<maxDepth<<" "<<duration_ms.count()<<endl;
+        if(cmp(best,cur)==0)best=cur;
+    }
+    return best;
 }
 int main() {
     ios_base::sync_with_stdio(0);
@@ -522,15 +582,16 @@ int main() {
     {
         grid[i][10]=1;
     }
-    /*for(int i=0;i<20;i++)
+   /* for(int i=0;i<20;i++)
     {
         for(int j=0;j<10;j++)
         {
             cin>>grid[i][j];
         }
-    }*/
-    /*cout<<getScoreOfGrid()<<endl;
+    }
+    cout<<getScoreOfGrid()<<endl;
     cout<<endl<<endl;
+    return 0;
     saveGrid();
     for(int j=4;j<6;j++)
     {
@@ -600,19 +661,25 @@ int main() {
     {   
         //if I press P stop the bot (fail safe instead of ctrl c from terminal)
         if (GetAsyncKeyState(0x50) & 0x8000) {
+            cout<<"done!"<<endl;
             break;
         }
 
         //1
         auto start = std::chrono::high_resolution_clock::now();
     
-        array<int,3>best_play = getBestPos(curPiece,0);
+        array<int,3>best_play = getBestPosIterative(curPiece);
+        
         auto end = std::chrono::high_resolution_clock::now();
         auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-        cout<<cur_move<<":"<<duration_ms.count()<<endl;
+        cout<<cur_move++<<":"<<duration_ms.count()<<endl;
+        cout<<best_play[0]<<" "<<best_play[1]<<" "<<best_play[2]<<endl;
         avg_time+=duration_ms.count();
         avg_count++;
         pushPiece(getLowestRow(best_play[0],best_play[1],curPiece),best_play[0],best_play[1],curPiece);
+        debugScore=1;
+        cout<<"score: "<<getScoreOfGrid()<<endl;
+        debugScore=0;
         
         
         
@@ -629,7 +696,7 @@ int main() {
         load_grid();
         curPiece=curQueue[0];
         curQueue=getQueue();        
-
+        //break;
         
         //std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }

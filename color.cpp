@@ -8,13 +8,18 @@ using namespace std;
 TODO list:
 ~~more~~ fix heuristics for the board eval
 brute force on more than one move ahead (iterative deepining)
+
+non added mechanics:
+hold piece ability
+side putting
+spins
 */
 HDC hScreenDC;
 HDC hMemoryDC;
 BITMAPINFO bmi;
 HBITMAP hBitmap;
 
-int maxDepth=1;
+int maxDepth=2;
 int x = 785;      // top-left X
 int y = 180;      // top-left Y
 int width = 520;  // region width
@@ -39,7 +44,6 @@ int cell_size=35;
 int grid_width=350,grid_height=700;
 //handling rotations will suck so much
 //I can just assume they are new pieces basically
-//how do I get current piece??
 Piece IPiece({124,254,198},{{{-1,0},{0,0},{1,0},{2,0}},{{1,1},{1,0},{1,-1},{1,-2}}},'I');
 Piece JPiece({148,144,222},{{{0,0},{1,0},{-1,0},{-1,-1}},{{0,0},{0,1},{0,-1},{1,-1}},{{0,0},{1,0},{-1,0},{1,1}},{{0,0},{-1,0},{0,-1},{0,-2}}},'J');
 Piece LPiece({250,165,126},{{{0,0},{1,0},{-1,0},{1,-1}},{{0,0},{1,0},{0,-1},{0,-2}},{{0,0},{1,0},{-1,0},{-1,1}},{{0,0},{0,1},{0,-1},{-1,-1}}},'L');
@@ -305,19 +309,19 @@ void actuallyPutThePiece(int pos,int rotateCount)
     {
         pressKey(VK_UP);
         rotateCount--;
-        Sleep(40);
+        Sleep(20);
     }
     while(curPos>pos)
     {
         pressKey(VK_LEFT);
         curPos--;
-        Sleep(40);
+        Sleep(20);
     }
     while(curPos<pos)
     {
         pressKey(VK_RIGHT);
         curPos++;
-        Sleep(40);
+        Sleep(20);
     }
     pressKey(VK_SPACE);
     Sleep(40);
@@ -400,7 +404,6 @@ int getScoreOfGrid()
     for(int j=0;j<10;j++)sm+=(firstInCol[j] * (max(1,firstInCol[j]-3)));
     int score = sm+cntIDep*cntIDep*5 + numberOfHoles*150 + aboveHoles*10 + mx*5;
     return score;
-
 }
 int clear_all_grid()
 {
@@ -555,9 +558,7 @@ int main() {
     }
     cout<<"HI"<<endl;
     double milliseconds = 0;
-    auto start = std::chrono::high_resolution_clock::now();
-    auto end = std::chrono::high_resolution_clock::now();
-    auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    
     int c=0;
     //This is for starting the game
     while (true) {
@@ -593,6 +594,8 @@ int main() {
         3. get new statep
     */
     int cur=1;
+    int cur_move=1;
+    double avg_time = 0,avg_count=0;
     while (1) 
     {   
         //if I press P stop the bot (fail safe instead of ctrl c from terminal)
@@ -601,7 +604,14 @@ int main() {
         }
 
         //1
+        auto start = std::chrono::high_resolution_clock::now();
+    
         array<int,3>best_play = getBestPos(curPiece,0);
+        auto end = std::chrono::high_resolution_clock::now();
+        auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+        cout<<cur_move<<":"<<duration_ms.count()<<endl;
+        avg_time+=duration_ms.count();
+        avg_count++;
         pushPiece(getLowestRow(best_play[0],best_play[1],curPiece),best_play[0],best_play[1],curPiece);
         
         
@@ -621,8 +631,10 @@ int main() {
         curQueue=getQueue();        
 
         
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        //std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
+    cout<<"average time per move: ";
+    cout<<fixed<<setprecision(4)<<avg_time/avg_count<<endl;
     
     DeleteObject(hBitmap);
     DeleteDC(hMemoryDC);

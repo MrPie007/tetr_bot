@@ -8,6 +8,31 @@ using namespace std;
 TODO list:
 runtime optimization ideas:
 represent board as a bitset, do all operations using bitwise operations
+Since the depth is constant (not like chess), I can generate all possible moves for the queue, and iterate on them making them all at once
+//estimation of complexity:
+each piece has 10 possible positions, and an average of 3~ rotations
+30^depth
+when depth is 4 (current piece + 3 from queue), then i'd need 810000 (1e6)
+it should be much less
+actually let me calculate it rq
+number of possible moves for each piece:
+17 34 34 9 17 17 34 
+avg = 23.33~
+
+expected number of possible moves for each depth:
+23.1429
+535.592
+12395.1
+286859
+6.63873e+06
+1.53639e+08
+
+max is 34^depth (if T,J,L and one of them gets repeated, its not that uncommon to happen..)
+34^4 =~ 1e6..
+
+
+current goal is to reach depth 3 in 0.1~s avg.
+
 
 
 
@@ -24,7 +49,9 @@ HDC hMemoryDC;
 BITMAPINFO bmi;
 HBITMAP hBitmap;
 
-int maxDepth=2;
+int maxDepth=1;
+int realMaxDepth=0;
+//realMaxDepth means how much lookahead in queue
 int x = 785;      // top-left X
 int y = 180;      // top-left Y
 int width = 520;  // region width
@@ -36,11 +63,12 @@ struct color{
     color(int R,int G,int B):R(R),G(G),B(B){}
 };
 struct Piece{
+    int ind=0;
     color c;
     //cells[0] is the original rotation, up or x will make it cells[1]
     vector<vector<pair<int,int>>>cells;
     char type;
-    Piece(color c,vector<vector<pair<int,int>>>cells,char type):c(c),cells(cells),type(type){}
+    Piece(int ind,color c,vector<vector<pair<int,int>>>cells,char type):ind(ind),c(c),cells(cells),type(type){}
 };
 vector<Piece>curQueue;
 vector<vector<int>>grid;
@@ -49,15 +77,17 @@ int cell_size=35;
 int grid_width=350,grid_height=700;
 //handling rotations will suck so much
 //I can just assume they are new pieces basically
-Piece IPiece({124,254,198},{{{-1,0},{0,0},{1,0},{2,0}},{{1,1},{1,0},{1,-1},{1,-2}}},'I');
-Piece JPiece({148,144,222},{{{0,0},{1,0},{-1,0},{-1,-1}},{{0,0},{0,1},{0,-1},{1,-1}},{{1,1},{0,0},{1,0},{-1,0}},{{0,0},{-1,0},{0,-1},{0,-2}}},'J');
-Piece LPiece({250,165,126},{{{0,0},{1,0},{-1,0},{1,-1}},{{0,0},{1,0},{0,-1},{0,-2}},{{0,0},{1,0},{-1,0},{-1,1}},{{0,1},{0,0},{0,-1},{-1,-1}}},'L');
-Piece OPiece({255,227,130},{{{0,0},{1,0},{0,-1},{1,-1}}},'O');
-Piece ZPiece({252,137,143},{{{0,0},{1,0},{0,-1},{-1,-1}},{{0,0},{1,0},{0,1},{1,-1}}},'Z');
-Piece SPiece({196,250,136},{{{0,0},{-1,0},{0,-1},{1,-1}},{{0,0},{0,-1},{1,0},{1,1}}},'S');
-Piece TPiece({231,135,211},{{{0,0},{-1,0},{1,0},{0,-1}},{{0,0},{0,1},{0,-1},{1,0}},{{0,0},{-1,0},{1,0},{0,1}},{{0,0},{0,1},{0,-1},{-1,0}}},'T');
+Piece IPiece(0,{124,254,198},{{{-1,0},{0,0},{1,0},{2,0}},{{1,1},{1,0},{1,-1},{1,-2}}},'I');
+Piece JPiece(1,{148,144,222},{{{0,0},{1,0},{-1,0},{-1,-1}},{{0,0},{0,1},{0,-1},{1,-1}},{{1,1},{0,0},{1,0},{-1,0}},{{0,0},{-1,0},{0,-1},{0,-2}}},'J');
+Piece LPiece(2,{250,165,126},{{{0,0},{1,0},{-1,0},{1,-1}},{{0,0},{1,0},{0,-1},{0,-2}},{{0,0},{1,0},{-1,0},{-1,1}},{{0,1},{0,0},{0,-1},{-1,-1}}},'L');
+Piece OPiece(3,{255,227,130},{{{0,0},{1,0},{0,-1},{1,-1}}},'O');
+Piece ZPiece(4,{252,137,143},{{{0,0},{1,0},{0,-1},{-1,-1}},{{0,0},{1,0},{0,1},{1,-1}}},'Z');
+Piece SPiece(5,{196,250,136},{{{0,0},{-1,0},{0,-1},{1,-1}},{{0,0},{0,-1},{1,0},{1,1}}},'S');
+Piece TPiece(6,{231,135,211},{{{0,0},{-1,0},{1,0},{0,-1}},{{0,0},{0,1},{0,-1},{1,0}},{{0,0},{-1,0},{1,0},{0,1}},{{0,0},{0,1},{0,-1},{-1,0}}},'T');
 Piece all_p[7]={IPiece,JPiece,LPiece,OPiece,ZPiece,SPiece,TPiece};
 char all_pc[7]={'I','J','L','O','Z','S','T'};
+Piece curPiece=IPiece;
+
 void pressKey(WORD keyCode) {
     INPUT ip;
     ip.type = INPUT_KEYBOARD;
@@ -222,7 +252,10 @@ bool SaveBMP(const char* filename, void* pPixels, int width, int height) {
 //row 20 is the floor, it is always filled with 1s
 //for clarityp
 //Pieces are defined by center piece, and positions of other pieces relative to it
-
+int unsolvableCells[30][15];
+int isIDep[10];
+int firstInCol[10];
+bool debugScore=0;
 void load_grid()
 {
     for(int i=15;i<grid_width;i+=cell_size)
@@ -304,7 +337,7 @@ void save_pic()
     SaveBMP(name.c_str(),pPixels,width,height);
     cout<<"SAVED"<<endl;
 }
-int delayPress=10;
+int delayPress=8;
 void actuallyPutThePiece(int pos,int rotateCount)
 {
     //4 is the default position of all pieces
@@ -342,7 +375,8 @@ void actuallyPutThePiece(int pos,int rotateCount)
         Sleep(delayPress);
     }
     pressKey(VK_SPACE);
-    Sleep(delayPress);
+    //this needs to be bigger, to give time for capture
+    Sleep(100);
 
 
 }
@@ -355,14 +389,10 @@ void actuallyPutThePiece(int pos,int rotateCount)
 //minimize stairs
 //minimize dependencies (especially I's)
 //minimize holes
-///todo: give weight for each criteria (and actually implement them)
-int unsolvableCells[30][15];
+///todo(done): give weight for each criteria (and actually implement them)
 
 //TODO: optimize this
 
-int isIDep[10];
-int firstInCol[10];
-bool debugScore=0;
 int getScoreOfGrid()
 {
     int mx=0,mn=-1;
@@ -413,7 +443,8 @@ int getScoreOfGrid()
     for(int j=0;j<10;j++)
     {
         firstInCol[j]-=mn;
-        sm+=(firstInCol[j] * (max(1,firstInCol[j]-10)));
+        firstInCol[j]++;
+        sm+=(firstInCol[j] * (max(1,firstInCol[j]-5)));
         for(int i=6;i<20;i++)
         {
             for(int k=0;k<4;k++)
@@ -438,7 +469,7 @@ int getScoreOfGrid()
         for(int j=0;j<10;j++)cout<<firstInCol[j]<<" ";
         cout<<endl;
     }
-    int score = sm+cntIDep*cntIDep*2 + numberOfHoles*200 + aboveHoles*3 + mx*mx;
+    int score = sm + numberOfHoles*50 + aboveHoles + mx;
     return score;
 }
 //TODO: somehow optmize this
@@ -474,7 +505,6 @@ int clear_all_grid()
     return ret;
 
 }
-
 stack<vector<vector<int>>>grids;
 void saveGrid()
 {
@@ -529,7 +559,7 @@ array<int,3> getBestPos(Piece &p,int curDepth)
             int cst=clear_all_grid();
             array<int,3>cur=getBestPos(curQueue[curDepth],curDepth+1);
             int curScore = cur[2] + -10*cst*cst*cst*cst;
-            if(curDepth == 1)
+            if(curDepth == 0)
             {
                 retV.push_back({j,rot,curScore});
             }
@@ -557,17 +587,119 @@ array<int,3> getBestPosIterative(Piece p)
 {
     array<int,3>best = {0,0,(int)1e9};
     array<int,3>cur;
-    for(maxDepth=2;maxDepth<=2;maxDepth++)
+    for(maxDepth=realMaxDepth;maxDepth<=realMaxDepth;maxDepth++)
     {
         retV.clear();
         auto start = std::chrono::high_resolution_clock::now();
-        cur=getBestPos(p,1);
+        cur=getBestPos(p,0);
         auto end = std::chrono::high_resolution_clock::now();
         auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
         cout<<maxDepth<<" "<<duration_ms.count()<<endl;
         if(cmp(best,cur)==0)best=cur;
     }
     return best;
+}
+vector<pair<int,int>>movesForPiece[7];
+void preCompMoves()
+{
+    for(int i=0;i<7;i++)
+        movesForPiece[i]=getMoves(all_p[i]);
+}
+vector<vector<pair<int,int>>>placements;
+void getPlacements(int depth,vector<pair<int,int>>&curMoves)
+{
+    if(depth>maxDepth)
+    {
+        placements.push_back(curMoves);
+        return;
+    }
+    int indOfPiece=0;
+    if(depth == 0)
+    {
+        indOfPiece=curPiece.ind;
+    }
+    else
+    {
+        indOfPiece=curQueue[depth-1].ind;
+    }
+    for(auto i:movesForPiece[indOfPiece])
+    {
+        curMoves.push_back(i);
+        getPlacements(depth+1,curMoves);
+        curMoves.pop_back();
+    }
+    
+}
+array<int,3> bruteForceOnAll()
+{
+    maxDepth=realMaxDepth;
+    placements.clear();
+    vector<pair<int,int>>temp;
+    //cout<<"Getting placements.."<<endl;
+    getPlacements(0,temp);
+    /*cout<<"Done"<<endl;
+    for(int i=0;i<placements.size();i++)
+    {
+        for(int j=0;j<placements[i].size();j++)
+        {
+            cout<<placements[i][j].first<<" "<<placements[i][j].second<<endl;
+        }
+        cout<<endl;
+    }
+    cout<<endl;
+    cout<<curPiece.type<<endl;*/
+
+
+    array<int,3>ret = {0,0,(int)1e9};
+    saveGrid();
+    for(int i=0;i<placements.size();i++)
+    {
+        int total_clr_cost=0;
+        for(int j=0;j<placements[i].size();j++)
+        {
+            int pieceInd = curPiece.ind;
+            if(j)pieceInd = curQueue[j-1].ind;
+            pushPiece(getLowestRow(placements[i][j].first,placements[i][j].second,all_p[pieceInd])
+            ,placements[i][j].first,placements[i][j].second,all_p[pieceInd]);
+            int cst=clear_all_grid();
+            cst = -10*cst*cst*cst*cst;
+            total_clr_cost+=cst;
+        }
+        int score=getScoreOfGrid()+total_clr_cost;
+        cout<<"algo2: "<<placements[i][0].first<<" "<<placements[i][0].second<<" "<<score<<endl;
+        
+        if(score<ret[2])
+        {
+            ret[2]=score;
+            ret[0]=placements[i][0].first;
+            ret[1]=placements[i][0].second;
+        }
+        resetGrid();
+    }
+    unsaveGrid();
+    return ret;
+    
+}
+double dp(int depth)
+{
+    if(depth == 0)return 1;
+    double ret=0;
+    for(int i=0;i<7;i++)
+    {
+        int cnt=0;
+        for(int j=-1;j<10;j++)
+        {
+            for(int rot=0;rot<all_p[i].cells.size();rot++)
+            {
+                if(getLowestRow(j,rot,all_p[i])!=-1)
+                {
+                    cnt++;
+                }
+            }
+        }
+        ret+=1.00/7.00 * (dp(depth-1))*(double)cnt;
+    }
+    return ret;
 }
 int main() {
     ios_base::sync_with_stdio(0);
@@ -582,7 +714,18 @@ int main() {
     {
         grid[i][10]=1;
     }
-   /* for(int i=0;i<20;i++)
+    preCompMoves();
+   /* for(int i=0;i<7;i++)
+    {
+        cout<<"i: "<<i<<endl;
+        for(auto j:movesForPiece[i])cout<<j.first<<" "<<j.second<<endl;
+    }*/
+    /*for(int j=0;j<=6;j++)cout<<dp(j)<<endl;
+    
+    
+    cout<<endl;
+    return 0;*/
+    /*for(int i=0;i<20;i++)
     {
         for(int j=0;j<10;j++)
         {
@@ -591,14 +734,14 @@ int main() {
     }
     cout<<getScoreOfGrid()<<endl;
     cout<<endl<<endl;
-    return 0;
+    //return 0;
     saveGrid();
-    for(int j=4;j<6;j++)
+    for(int j=0;j<1;j++)
     {
-        for(int rot=0;rot<1;rot++){
-            cout<<j<<" "<<rot<<":";
-            if(getLowestRow(j,rot,ZPiece)==-1)continue;
-            pushPiece(getLowestRow(j,rot,ZPiece),j,rot,ZPiece);
+        for(int rot=1;rot<=1;rot++){
+            //cout<<j<<" "<<rot<<":";
+            if(getLowestRow(j,rot,JPiece)==-1)continue;
+            pushPiece(getLowestRow(j,rot,JPiece),j,rot,JPiece);
             for(int i=0;i<20;i++)
             {
                 for(int j=0;j<10;j++)cout<<grid[i][j]<<" ";
@@ -608,6 +751,8 @@ int main() {
             resetGrid();
         }
     }
+    //TIL that I was redeclaring the global cur piece which was making algo 2 different than algo 1
+    //2 hours for this wow...
     return 0;*/
     init();
     //I will need to use the extra space at the top later, will implement as if I don't need it tho rn
@@ -637,7 +782,7 @@ int main() {
     //I need to put a piece first before bot taking over
     while (true) {
         if (GetAsyncKeyState(VK_SPACE) & 0x8000) {
-            Sleep(400);
+            Sleep(200);
             break;
         }
         Sleep(50);
@@ -645,8 +790,9 @@ int main() {
     capture();    
     load_grid();
     save_pic();
-    Piece curPiece = curQueue[0];
+    ///REMEMBER that you swapped those becaues of custom game rules
     curQueue = getQueue();
+    curPiece = curQueue[0];
     /*
         Flow of logic should be something like
 
@@ -672,8 +818,40 @@ int main() {
         
         auto end = std::chrono::high_resolution_clock::now();
         auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-        cout<<cur_move++<<":"<<duration_ms.count()<<endl;
-        cout<<best_play[0]<<" "<<best_play[1]<<" "<<best_play[2]<<endl;
+        double time1 = duration_ms.count();
+        for(int i=0;i<retV.size();i++)
+        {
+            cout<<"algo1: "<<retV[i][0]<<" "<<retV[i][1]<<" "<<retV[i][2]<<endl;
+        }
+        cout<<curPiece.type<<endl;
+        for(int i=0;i<20;i++)
+        {
+            for(int j=0;j<10;j++)cout<<grid[i][j]<<" ";
+            cout<<endl;
+        }
+        cout<<endl<<endl;
+
+
+        start = std::chrono::high_resolution_clock::now();
+
+        array<int,3>best_play2 = bruteForceOnAll();
+
+        end = std::chrono::high_resolution_clock::now();
+        duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+        double time2 = duration_ms.count();
+
+
+        cout<<"move:"<<cur_move++<<"\n time spent first algo:"<<time1<<" time2: "<<time2<<endl;
+        cout<<curPiece.type<<endl;
+        for(int i=0;i<20;i++)
+        {
+            for(int j=0;j<10;j++)cout<<grid[i][j]<<" ";
+            cout<<endl;
+        }
+        cout<<endl;
+        cout<<"best move: ";
+        cout<<best_play[0]<<" "<<best_play[1]<<"\nbest score: "<<best_play[2]<<endl;
+        cout<<"best move 2: "<<best_play2[0]<<" "<<best_play2[1]<<" score: "<<best_play2[2]<<endl;;
         avg_time+=duration_ms.count();
         avg_count++;
         pushPiece(getLowestRow(best_play[0],best_play[1],curPiece),best_play[0],best_play[1],curPiece);
@@ -698,7 +876,7 @@ int main() {
         curQueue=getQueue();        
         //break;
         
-        //std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     }
     cout<<"average time per move: ";
     cout<<fixed<<setprecision(4)<<avg_time/avg_count<<endl;

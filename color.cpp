@@ -3,12 +3,16 @@
 #include <chrono>
 #include <thread>
 using namespace std;
-
 /*
-TODO list:
-runtime optimization ideas:
-represent board as a bitset, do all operations using bitwise operations
-Since the depth is constant (not like chess), I can generate all possible moves for the queue, and iterate on them making them all at once
+info:
+expected number of possible moves for each depth:
+23.1429
+535.592
+12395.1
+286859
+6.63873e+06
+1.53639e+08
+
 //estimation of complexity:
 each piece has 10 possible positions, and an average of 3~ rotations
 30^depth
@@ -19,25 +23,22 @@ number of possible moves for each piece:
 17 34 34 9 17 17 34 
 avg = 23.33~
 
-expected number of possible moves for each depth:
-23.1429
-535.592
-12395.1
-286859
-6.63873e+06
-1.53639e+08
-
 max is 34^depth (if T,J,L and one of them gets repeated, its not that uncommon to happen..)
 34^4 =~ 1e6..
+*/
+/*
+runtime optimization ideas:
+represent board as a bitset, do all operations using bitwise operations
+Since the depth is constant (not like chess), I can generate all possible moves for the queue, and iterate on them making them all at once
 
-
+(after implementing that idea:)
+the generate all states first approach was slower, I'll just optimize the recursive one as much as I can
+(it might be faster if I was able to not clear the grid every time I make a move)
+*/
+/*
+TODO list:
 current goal is to reach depth 3 in 0.1~s avg.
-
-
-
-
 ~~more~~ fix heuristics for the board eval
-brute force on more than one move ahead (iterative deepining)
 
 non added mechanics:
 hold piece ability
@@ -49,8 +50,8 @@ HDC hMemoryDC;
 BITMAPINFO bmi;
 HBITMAP hBitmap;
 
-int maxDepth=1;
-int realMaxDepth=0;
+int maxDepth=3;
+int realMaxDepth=3;
 //realMaxDepth means how much lookahead in queue
 int x = 785;      // top-left X
 int y = 180;      // top-left Y
@@ -254,7 +255,7 @@ bool SaveBMP(const char* filename, void* pPixels, int width, int height) {
 //Pieces are defined by center piece, and positions of other pieces relative to it
 int unsolvableCells[30][15];
 int isIDep[10];
-int firstInCol[10];
+vector<int>firstInCol(10,0);
 bool debugScore=0;
 void load_grid()
 {
@@ -281,6 +282,7 @@ void popPiece(int i,int j,int rot, Piece p)
         int ni = i+p.cells[rot][k].second;
         int nj = j+p.cells[rot][k].first;
         grid[ni][nj]=0;
+        ///Reminder that this won't update the firstInCol..
     }
 }
 void pushPiece(int i,int j,int rot, Piece p)
@@ -292,8 +294,11 @@ void pushPiece(int i,int j,int rot, Piece p)
         int nj = j+p.cells[rot][k].first;
         assert(ni>=0 && ni<20 && nj>=0 && nj<10 && grid[ni][nj]==0);
         grid[ni][nj]=1;
+        firstInCol[nj]=max(firstInCol[nj],20-ni);
     }
 }
+//TODO (important) optimize this as much as possible
+//idea, I can get the lowest row by finding the max in each column
 int getLowestRow(int j, int rot, Piece p)
 {
     //j is the position for the "core" of the piece
@@ -341,8 +346,8 @@ int delayPress=8;
 void actuallyPutThePiece(int pos,int rotateCount)
 {
     //4 is the default position of all pieces
-    //TODO, implement the ability to rotate
-    //TODO, add the coordinates of rotated pieces for each piece
+    //TODO(done), implement the ability to rotate
+    //TODO(done), add the coordinates of rotated pieces for each piece
     int curPos=4;
     if(rotateCount == 3)
     {
@@ -398,7 +403,6 @@ int getScoreOfGrid()
     int mx=0,mn=-1;
     int numberOfHoles=0;
     memset(unsolvableCells,0,sizeof(unsolvableCells));
-    memset(firstInCol,0,sizeof(firstInCol));
     memset(isIDep,0,sizeof(isIDep));
     int aboveHoles=0;
     for(int i=2;i<20;i++)
@@ -411,14 +415,7 @@ int getScoreOfGrid()
                 unsolvableCells[i][j]=1;
                 numberOfHoles++;
             }
-            if(grid[i][j])
-            {
-                if(firstInCol[j]==0){
-                    firstInCol[j]=20-i;
-                }
-            }
             mx=max(mx,firstInCol[j]);
-            
             if(i==19 && (mn == -1 || firstInCol[j]<mn))mn=firstInCol[j];
         }
     }
@@ -442,9 +439,8 @@ int getScoreOfGrid()
     int sm=0;
     for(int j=0;j<10;j++)
     {
-        firstInCol[j]-=mn;
-        firstInCol[j]++;
-        sm+=(firstInCol[j] * (max(1,firstInCol[j]-5)));
+        
+        sm+=((firstInCol[j]-mn+1) * (max(1,(firstInCol[j]-mn+1)-5)));
         for(int i=6;i<20;i++)
         {
             for(int k=0;k<4;k++)
@@ -475,6 +471,7 @@ int getScoreOfGrid()
 //TODO: somehow optmize this
 int clear_all_grid()
 {
+    firstInCol = vector<int>(10,0);
     int ret=0;
     vector<int>rows;
     for(int i=19;i>=0;i--)
@@ -494,7 +491,11 @@ int clear_all_grid()
     {
         if(it<rows.size())
         {
-            for(int j=0;j<10;j++)grid[i][j]=grid[rows[it]][j];
+            for(int j=0;j<10;j++)
+            {
+                grid[i][j]=grid[rows[it]][j];
+                if(grid[i][j])firstInCol[j]=max(firstInCol[j],20-i);
+            }
             it++;
         }
         else
@@ -506,17 +507,21 @@ int clear_all_grid()
 
 }
 stack<vector<vector<int>>>grids;
+stack<vector<int>>firstInCols;
 void saveGrid()
 {
     grids.push(grid);
+    firstInCols.push(firstInCol);
 }
 void resetGrid()
 {
     grid=grids.top();
+    firstInCol=firstInCols.top();
 }
 void unsaveGrid()
 {
     grids.pop();
+    firstInCols.pop();
 }
 vector<pair<int,int>>getMoves(Piece &p)
 {
@@ -594,7 +599,7 @@ array<int,3> getBestPosIterative(Piece p)
         cur=getBestPos(p,0);
         auto end = std::chrono::high_resolution_clock::now();
         auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-        cout<<maxDepth<<" "<<duration_ms.count()<<endl;
+        //cout<<maxDepth<<" "<<duration_ms.count()<<endl;
         if(cmp(best,cur)==0)best=cur;
     }
     return best;
@@ -666,7 +671,7 @@ array<int,3> bruteForceOnAll()
             total_clr_cost+=cst;
         }
         int score=getScoreOfGrid()+total_clr_cost;
-        cout<<"algo2: "<<placements[i][0].first<<" "<<placements[i][0].second<<" "<<score<<endl;
+       // cout<<"algo2: "<<placements[i][0].first<<" "<<placements[i][0].second<<" "<<score<<endl;
         
         if(score<ret[2])
         {
@@ -714,7 +719,7 @@ int main() {
     {
         grid[i][10]=1;
     }
-    preCompMoves();
+    //preCompMoves();
    /* for(int i=0;i<7;i++)
     {
         cout<<"i: "<<i<<endl;
@@ -819,7 +824,7 @@ int main() {
         auto end = std::chrono::high_resolution_clock::now();
         auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
         double time1 = duration_ms.count();
-        for(int i=0;i<retV.size();i++)
+       /* for(int i=0;i<retV.size();i++)
         {
             cout<<"algo1: "<<retV[i][0]<<" "<<retV[i][1]<<" "<<retV[i][2]<<endl;
         }
@@ -829,29 +834,29 @@ int main() {
             for(int j=0;j<10;j++)cout<<grid[i][j]<<" ";
             cout<<endl;
         }
-        cout<<endl<<endl;
+        cout<<endl<<endl;*/
 
 
-        start = std::chrono::high_resolution_clock::now();
+        /*start = std::chrono::high_resolution_clock::now();
 
         array<int,3>best_play2 = bruteForceOnAll();
 
         end = std::chrono::high_resolution_clock::now();
         duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-        double time2 = duration_ms.count();
+        double time2 = duration_ms.count();*/
 
 
-        cout<<"move:"<<cur_move++<<"\n time spent first algo:"<<time1<<" time2: "<<time2<<endl;
+        cout<<"move:"<<cur_move++<<"\n time spent first algo:"<<time1<<endl;//" time2: "<<time2<<endl;
         cout<<curPiece.type<<endl;
-        for(int i=0;i<20;i++)
+        /*for(int i=0;i<20;i++)
         {
             for(int j=0;j<10;j++)cout<<grid[i][j]<<" ";
             cout<<endl;
-        }
-        cout<<endl;
+        }*/
+        //cout<<endl;
         cout<<"best move: ";
         cout<<best_play[0]<<" "<<best_play[1]<<"\nbest score: "<<best_play[2]<<endl;
-        cout<<"best move 2: "<<best_play2[0]<<" "<<best_play2[1]<<" score: "<<best_play2[2]<<endl;;
+        //cout<<"best move 2: "<<best_play2[0]<<" "<<best_play2[1]<<" score: "<<best_play2[2]<<endl;;
         avg_time+=duration_ms.count();
         avg_count++;
         pushPiece(getLowestRow(best_play[0],best_play[1],curPiece),best_play[0],best_play[1],curPiece);

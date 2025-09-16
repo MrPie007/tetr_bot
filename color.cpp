@@ -50,8 +50,8 @@ HDC hMemoryDC;
 BITMAPINFO bmi;
 HBITMAP hBitmap;
 
-int maxDepth=3;
-int realMaxDepth=3;
+int maxDepth=2;
+int realMaxDepth=2;
 //realMaxDepth means how much lookahead in queue
 int x = 785;      // top-left X
 int y = 180;      // top-left Y
@@ -303,31 +303,27 @@ int getLowestRow(int j, int rot, Piece p)
 {
     //j is the position for the "core" of the piece
     //I need to put it as down as possible
-    int to_put=-1;
+    int to_put=20;
     ///HERE I also reduce space from top of grid..
     //this should be really optimizable
-    for(int i=2;i<=20;i++)
+    bool valid=1;
+    for(int k=0;k<p.cells[rot].size();k++)
     {
-        bool valid=1;
-        for(int k=0;k<p.cells[rot].size();k++)
+        
+        int nj = j+p.cells[rot][k].first;
+        if(nj>=10 || nj<0)
         {
-            int ni = i+p.cells[rot][k].second;
-            int nj = j+p.cells[rot][k].first;
-            if(ni>=20 || ni<0 || nj>=10 || nj<0 || grid[ni][nj]==1)
-            {
-                valid=0;
-                break;
-            }
+            return -1;
         }
-        if(valid)
-        {
-            to_put=i;
-        }
-        else
-        {
-            break;
-        }
+        to_put=min(to_put,19-firstInCol[nj]-p.cells[rot][k].second);
+        /*
+        0 0 0 0 0 x x 0 0 0 (17th) 4
+        0 0 0 0 0 1 x x 0 0 (18th) 2
+        0 1 1 0 0 1 0 0 0 0 (19th) 1
+        1 1 1 1 1 1 1 1 1 1 (20th) 0
+        */
     }
+    
     return to_put;
 }
 //ASSUMPTIONS
@@ -730,7 +726,7 @@ int main() {
     
     cout<<endl;
     return 0;*/
-    /*for(int i=0;i<20;i++)
+   /* for(int i=0;i<20;i++)
     {
         for(int j=0;j<10;j++)
         {
@@ -740,21 +736,25 @@ int main() {
     cout<<getScoreOfGrid()<<endl;
     cout<<endl<<endl;
     //return 0;
+    clear_all_grid();
+    cout<<"first in col: ";
+    for(int i=0;i<10;i++)cout<<firstInCol[i]<<" ";
+    cout<<endl;
     saveGrid();
-    for(int j=0;j<1;j++)
+    
+    for(int i=0;i<7;i++)
     {
-        for(int rot=1;rot<=1;rot++){
-            //cout<<j<<" "<<rot<<":";
-            if(getLowestRow(j,rot,JPiece)==-1)continue;
-            pushPiece(getLowestRow(j,rot,JPiece),j,rot,JPiece);
-            for(int i=0;i<20;i++)
+        cout<<"!!!!!!!!!i: "<<i<<endl;
+        for(int j=-1;j<10;j++)
+        {
+            cout<<j<<":";
+            for(int rot=0;rot<all_p[i].cells.size();rot++)
             {
-                for(int j=0;j<10;j++)cout<<grid[i][j]<<" ";
-                cout<<endl;
+                cout<<getLowestRow(j,rot,all_p[i])<<" ";
             }
-            cout<<getScoreOfGrid()<<endl;
-            resetGrid();
+            cout<<endl;
         }
+        cout<<endl;
     }
     //TIL that I was redeclaring the global cur piece which was making algo 2 different than algo 1
     //2 hours for this wow...
@@ -815,6 +815,8 @@ int main() {
             cout<<"done!"<<endl;
             break;
         }
+        cout<<curPiece.type<<endl;
+        clear_all_grid();
 
         //1
         auto start = std::chrono::high_resolution_clock::now();
@@ -847,7 +849,7 @@ int main() {
 
 
         cout<<"move:"<<cur_move++<<"\n time spent first algo:"<<time1<<endl;//" time2: "<<time2<<endl;
-        cout<<curPiece.type<<endl;
+        
         /*for(int i=0;i<20;i++)
         {
             for(int j=0;j<10;j++)cout<<grid[i][j]<<" ";

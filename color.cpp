@@ -2,6 +2,7 @@
 #include <bits/stdc++.h>
 #include <chrono>
 #include <thread>
+#include "screen_layout.h"
 using namespace std;
 /*
 info:
@@ -50,15 +51,193 @@ HDC hMemoryDC;
 BITMAPINFO bmi;
 HBITMAP hBitmap;
 
-int maxDepth=2;
-int realMaxDepth=2;
-//realMaxDepth means how much lookahead in queue
-int x = 785;      // top-left X
-int y = 180;      // top-left Y
-int width = 520;  // region width
-int height = 720; // region height
+constexpr int queuedPiecesToLookAhead=1;
+constexpr DWORD inputDelayMs=2;
+constexpr DWORD screenUpdateDelayMs=20;
+constexpr DWORD inputPollingDelayMs=4;
+int maxDepth=queuedPiecesToLookAhead;
+int realMaxDepth=queuedPiecesToLookAhead;
+constexpr int boardColumns=10;
+constexpr int boardRows=20;
+constexpr int queueLength=5;
+constexpr int cellSampleRadius=1;
+ScreenLayout screenLayout;
+int x=0;
+int y=0;
+int width=0;
+int height=0;
 void* pPixels = nullptr;
 unsigned int* pixels;
+
+struct TimingSeries {
+    vector<double> samples;
+
+    void add(double milliseconds) {
+        samples.push_back(milliseconds);
+    }
+
+    double total() const {
+        return accumulate(samples.begin(),samples.end(),0.0);
+    }
+
+    double average() const {
+        return samples.empty()?0.0:total()/samples.size();
+    }
+
+    double percentile(double fraction) const {
+        if(samples.empty()) return 0.0;
+        vector<double> sorted=samples;
+        sort(sorted.begin(),sorted.end());
+        size_t index=static_cast<size_t>(ceil(fraction*sorted.size()))-1;
+        return sorted[min(index,sorted.size()-1)];
+    }
+
+    double minimum() const {
+        return samples.empty()?0.0:*min_element(samples.begin(),samples.end());
+    }
+
+    double maximum() const {
+        return samples.empty()?0.0:*max_element(samples.begin(),samples.end());
+    }
+};
+
+struct BenchmarkStats {
+    TimingSeries boardPreparation;
+    TimingSeries search;
+    TimingSeries placementInput;
+    TimingSeries renderWait;
+    TimingSeries screenCapture;
+    TimingSeries gridRead;
+    TimingSeries queueRead;
+    TimingSeries lookingTotal;
+    TimingSeries placingTotal;
+    TimingSeries fullCycle;
+    string activeStage;
+    chrono::steady_clock::time_point activeStageStart;
+
+    void beginStage(const string& name) {
+        activeStage=name;
+        activeStageStart=chrono::steady_clock::now();
+    }
+
+    double finishStage(TimingSeries& series) {
+        double elapsed=chrono::duration<double,milli>(
+            chrono::steady_clock::now()-activeStageStart
+        ).count();
+        series.add(elapsed);
+        activeStage.clear();
+        return elapsed;
+    }
+
+    double activeStageElapsed() const {
+        if(activeStage.empty()) return 0.0;
+        return chrono::duration<double,milli>(
+            chrono::steady_clock::now()-activeStageStart
+        ).count();
+    }
+
+    static void printSeries(const string& name,const TimingSeries& series) {
+        cout<<left<<setw(22)<<name<<right
+            <<setw(10)<<series.samples.size()
+            <<setw(12)<<series.average()
+            <<setw(12)<<series.percentile(0.50)
+            <<setw(12)<<series.percentile(0.95)
+            <<setw(12)<<series.minimum()
+            <<setw(12)<<series.maximum()<<'\n';
+    }
+
+    static string csvEscape(string value) {
+        size_t position=0;
+        while((position=value.find('"',position))!=string::npos) {
+            value.insert(position,"\"");
+            position+=2;
+        }
+        return '"'+value+'"';
+    }
+
+    void appendCsv(const string& reason) const {
+        filesystem::path path=executableDirectory()/"benchmark_results.csv";
+        error_code fileError;
+        bool needsHeader=!filesystem::exists(path,fileError)
+            || filesystem::file_size(path,fileError)==0;
+        ofstream output(path,ios::app);
+        if(!output) {
+            cerr<<"Could not append benchmark results to "<<path.string()<<'\n';
+            return;
+        }
+
+        time_t now=time(nullptr);
+        tm localTime{};
+        localtime_s(&localTime,&now);
+        ostringstream timestamp;
+        timestamp<<put_time(&localTime,"%Y-%m-%d %H:%M:%S");
+
+        if(needsHeader) {
+            output
+                <<"timestamp,termination,completed_moves,lookahead_pieces,"
+                <<"input_delay_ms,render_wait_target_ms,failed_stage,"
+                <<"avg_prepare_ms,avg_search_ms,avg_input_ms,avg_render_wait_ms,"
+                <<"avg_capture_ms,avg_grid_read_ms,avg_queue_read_ms,"
+                <<"avg_looking_ms,avg_placing_ms,avg_cycle_ms,p95_cycle_ms,avg_pps\n";
+        }
+        output<<csvEscape(timestamp.str())<<','
+              <<csvEscape(reason)<<','
+              <<fullCycle.samples.size()<<','
+              <<queuedPiecesToLookAhead<<','
+              <<inputDelayMs<<','
+              <<screenUpdateDelayMs<<','
+              <<csvEscape(activeStage)<<','
+              <<boardPreparation.average()<<','
+              <<search.average()<<','
+              <<placementInput.average()<<','
+              <<renderWait.average()<<','
+              <<screenCapture.average()<<','
+              <<gridRead.average()<<','
+              <<queueRead.average()<<','
+              <<lookingTotal.average()<<','
+              <<placingTotal.average()<<','
+              <<fullCycle.average()<<','
+              <<fullCycle.percentile(0.95)<<','
+              <<(fullCycle.average()>0.0?1000.0/fullCycle.average():0.0)<<'\n';
+        cout<<"Benchmark row appended to "<<path.string()<<'\n';
+    }
+
+    void printSummary(const string& reason) const {
+        cout<<"\n================ BENCHMARK SUMMARY ================\n";
+        cout<<"Termination: "<<reason<<'\n';
+        cout<<"Completed moves: "<<fullCycle.samples.size()<<'\n';
+        if(!activeStage.empty()) {
+            cout<<"Interrupted stage: "<<activeStage
+                <<" ("<<activeStageElapsed()<<" ms before failure)\n";
+        }
+        cout<<fixed<<setprecision(3);
+        cout<<left<<setw(22)<<"Stage"<<right
+            <<setw(10)<<"Samples"
+            <<setw(12)<<"Average"
+            <<setw(12)<<"Median"
+            <<setw(12)<<"P95"
+            <<setw(12)<<"Min"
+            <<setw(12)<<"Max"<<'\n';
+        printSeries("Board preparation",boardPreparation);
+        printSeries("Search",search);
+        printSeries("Placement input",placementInput);
+        printSeries("Render wait",renderWait);
+        printSeries("Screen capture",screenCapture);
+        printSeries("Grid read",gridRead);
+        printSeries("Queue read",queueRead);
+        printSeries("Looking total",lookingTotal);
+        printSeries("Placing total",placingTotal);
+        printSeries("Full cycle",fullCycle);
+        if(fullCycle.average()>0.0) {
+            cout<<"Average throughput: "<<(1000.0/fullCycle.average())<<" pieces/s\n";
+        }
+        cout<<"===================================================\n";
+        appendCsv(reason);
+    }
+};
+
+BenchmarkStats benchmarkStats;
+
 struct color{
     int R,G,B;
     color(int R,int G,int B):R(R),G(G),B(B){}
@@ -73,9 +252,6 @@ struct Piece{
 };
 vector<Piece>curQueue;
 vector<vector<int>>grid;
-vector<vector<int>>tempGrid;
-int cell_size=35;
-int grid_width=350,grid_height=700;
 //handling rotations will suck so much
 //I can just assume they are new pieces basically
 Piece IPiece(0,{124,254,198},{{{-1,0},{0,0},{1,0},{2,0}},{{1,1},{1,0},{1,-1},{1,-2}}},'I');
@@ -112,6 +288,13 @@ void capture()
     // Pixel buffer is ready in pPixels (BGRA format)
     pixels = (unsigned int*)pPixels;
 }
+void configureCaptureRegion()
+{
+    x=min(screenLayout.board.left,screenLayout.nextQueue.left);
+    y=min(screenLayout.board.top,screenLayout.nextQueue.top);
+    width=max(screenLayout.board.right,screenLayout.nextQueue.right)-x;
+    height=max(screenLayout.board.bottom,screenLayout.nextQueue.bottom)-y;
+}
 void init()
 {
     // Get screen DC
@@ -130,6 +313,26 @@ void init()
     
     hBitmap = CreateDIBSection(hMemoryDC, &bmi, DIB_RGB_COLORS, &pPixels, NULL, 0);
     SelectObject(hMemoryDC, hBitmap);
+}
+void cleanupCapture()
+{
+    if(hMemoryDC)
+    {
+        DeleteDC(hMemoryDC);
+        hMemoryDC=nullptr;
+    }
+    if(hBitmap)
+    {
+        DeleteObject(hBitmap);
+        hBitmap=nullptr;
+    }
+    if(hScreenDC)
+    {
+        ReleaseDC(NULL,hScreenDC);
+        hScreenDC=nullptr;
+    }
+    pPixels=nullptr;
+    pixels=nullptr;
 }
 color getPixelRel(int px,int py)
 {
@@ -156,6 +359,10 @@ int cc=0;
 color getMaxInRegion(int tx,int ty,int bx,int by)
 {
     color ret(0,0,0);
+    tx=max(tx,0);
+    ty=max(ty,0);
+    bx=min(bx,width-1);
+    by=min(by,height-1);
     for(int i=tx;i<=bx;i++)
     {
         for(int j=ty;j<=by;j++)
@@ -171,16 +378,62 @@ color getMaxInRegion(int tx,int ty,int bx,int by)
     return ret;
 }
 
+int getColorDistance(color first,color second)
+{
+    int red=first.R-second.R;
+    int green=first.G-second.G;
+    int blue=first.B-second.B;
+    return red*red+green*green+blue*blue;
+}
+int getNearestPieceColorDistance(color sampledColor)
+{
+    int bestDistance=numeric_limits<int>::max();
+    for(const Piece& piece:all_p)
+    {
+        bestDistance=min(bestDistance,getColorDistance(sampledColor,piece.c));
+    }
+    return bestDistance;
+}
+color getRepresentativePieceColor(int tx,int ty,int bx,int by)
+{
+    color bestColor(0,0,0);
+    int bestDistance=numeric_limits<int>::max();
+    for(int px=tx;px<=bx;px++)
+    {
+        for(int py=ty;py<=by;py++)
+        {
+            color sampledColor=getPixelRel(px,py);
+            int highest=max({sampledColor.R,sampledColor.G,sampledColor.B});
+            int lowest=min({sampledColor.R,sampledColor.G,sampledColor.B});
+
+            // Ignore the black background and white/gray panel borders.
+            if(highest<50 || highest-lowest<20)
+            {
+                continue;
+            }
+
+            int distance=getNearestPieceColorDistance(sampledColor);
+            if(distance<bestDistance)
+            {
+                bestDistance=distance;
+                bestColor=sampledColor;
+            }
+        }
+    }
+    return bestColor;
+}
 vector<color>getQueueColors()
 {
     vector<color>ret;
-    for(int i=0;i<5;i++)
+    int tx=screenLayout.nextQueue.left-x;
+    int bx=screenLayout.nextQueue.right-x-1;
+    int queueTop=screenLayout.nextQueue.top-y;
+    int queueHeight=screenLayout.nextQueue.height();
+    for(int i=0;i<queueLength;i++)
     {
-        int ty = 50+100*i;
-        int by = ty+70;
-        int tx = 420;
-        int bx = 420+70;
-        ret.push_back(getMaxInRegion(tx,ty,bx,by));
+        int ty=queueTop+(queueHeight*i)/queueLength;
+        int by=queueTop+(queueHeight*(i+1))/queueLength-1;
+        ret.push_back(getRepresentativePieceColor(tx,ty,bx,by));
     }
     return ret;
 }
@@ -190,7 +443,7 @@ Piece getPieceByColor(color c)
     int mxi=0;
     for(int i=0;i<7;i++)
     {
-        int diff=abs(c.R - all_p[i].c.R)*abs(c.R - all_p[i].c.R)+abs(c.G - all_p[i].c.G)*abs(c.G - all_p[i].c.G)+abs(c.B - all_p[i].c.B)*abs(c.B - all_p[i].c.B);
+        int diff=getColorDistance(c,all_p[i].c);
         if(diff<mx)
         {
             mx=diff,mxi=i;
@@ -198,13 +451,17 @@ Piece getPieceByColor(color c)
     }
     return all_p[mxi];
 }
-vector<Piece>getQueue()
+vector<Piece>getQueue(vector<color>* sampledColors=nullptr)
 {
     vector<Piece>ret;
     vector<color>colors=getQueueColors();
-    for(int i=0;i<colors.size();i++)
+    if(sampledColors)
     {
-        ret.push_back(getPieceByColor(colors[i]));
+        *sampledColors=colors;
+    }
+    for(const color& sampledColor:colors)
+    {
+        ret.push_back(getPieceByColor(sampledColor));
     }
     return ret;
 
@@ -259,18 +516,29 @@ vector<int>firstInCol(10,0);
 bool debugScore=0;
 void load_grid()
 {
-    for(int i=15;i<grid_width;i+=cell_size)
+    const double cellWidth=static_cast<double>(screenLayout.board.width())/boardColumns;
+    const double cellHeight=static_cast<double>(screenLayout.board.height())/boardRows;
+    const int boardLeft=screenLayout.board.left-x;
+    const int boardTop=screenLayout.board.top-y;
+    for(int row=0;row<boardRows;row++)
     {
-        for(int j=15;j<grid_height;j+=cell_size)
+        for(int column=0;column<boardColumns;column++)
         {
-            color cur = getMaxInRegion(i,j,i+2,j+2);
+            int centerX=boardLeft+static_cast<int>(lround((column+0.5)*cellWidth));
+            int centerY=boardTop+static_cast<int>(lround((row+0.5)*cellHeight));
+            color cur=getMaxInRegion(
+                centerX-cellSampleRadius,
+                centerY-cellSampleRadius,
+                centerX+cellSampleRadius,
+                centerY+cellSampleRadius
+            );
             if(cur.R>34 || cur.G>34 || cur.B>34)
             {
-                grid[j/cell_size][i/cell_size] = 1;
+                grid[row][column] = 1;
             }
             else
             {
-                grid[j/cell_size][i/cell_size] = 0;
+                grid[row][column] = 0;
             }
         }
     }
@@ -292,7 +560,20 @@ void pushPiece(int i,int j,int rot, Piece p)
     {
         int ni = i+p.cells[rot][k].second;
         int nj = j+p.cells[rot][k].first;
-        assert(ni>=0 && ni<20 && nj>=0 && nj<10 && grid[ni][nj]==0);
+        bool inBounds=ni>=0 && ni<boardRows && nj>=0 && nj<boardColumns;
+        if(!inBounds || grid[ni][nj]!=0)
+        {
+            ostringstream error;
+            error<<"Invalid simulated placement: piece="<<p.type
+                 <<", center=("<<i<<", "<<j<<")"
+                 <<", rotation="<<rot
+                 <<", cell=("<<ni<<", "<<nj<<")";
+            if(inBounds)
+            {
+                error<<", occupied="<<grid[ni][nj];
+            }
+            throw runtime_error(error.str());
+        }
         grid[ni][nj]=1;
         firstInCol[nj]=max(firstInCol[nj],20-ni);
     }
@@ -332,13 +613,62 @@ int getLowestRow(int j, int rot, Piece p)
 //(although they act differently)
 //J,L,T have 4 rotations
 int cnt=0;
-void save_pic()
+filesystem::path saveDebugCapture()
 {
-    string name = "out" + to_string(cnt++) + ".bmp";
-    SaveBMP(name.c_str(),pPixels,width,height);
-    cout<<"SAVED"<<endl;
+    filesystem::path path=executableDirectory()/("debug_capture_"+to_string(cnt++)+".bmp");
+    if(!SaveBMP(path.string().c_str(),pPixels,width,height))
+    {
+        cerr<<"Could not save debug capture: "<<path.string()<<endl;
+        return {};
+    }
+    return path;
 }
-int delayPress=8;
+void printDebugSnapshot(
+    const string& label,
+    const vector<Piece>& queue,
+    const vector<color>& queueColors,
+    optional<char> currentPieceType=nullopt
+)
+{
+    const filesystem::path capturePath=saveDebugCapture();
+    cout<<"\n=== DEBUG SNAPSHOT: "<<label<<" ===\n";
+    if(!capturePath.empty())
+    {
+        cout<<"Captured image: "<<capturePath.string()<<'\n';
+    }
+    cout<<"Capture rect: ("<<x<<", "<<y<<") "<<width<<" x "<<height<<'\n';
+    cout<<"Board rect:   ("<<screenLayout.board.left<<", "<<screenLayout.board.top
+        <<") "<<screenLayout.board.width()<<" x "<<screenLayout.board.height()<<'\n';
+    cout<<"NEXT rect:    ("<<screenLayout.nextQueue.left<<", "<<screenLayout.nextQueue.top
+        <<") "<<screenLayout.nextQueue.width()<<" x "<<screenLayout.nextQueue.height()<<'\n';
+    if(currentPieceType)
+    {
+        cout<<"Tracked current piece: "<<*currentPieceType<<'\n';
+    }
+
+    cout<<"\nDetected board (# = filled, . = empty)\n";
+    cout<<"    0123456789\n";
+    for(int row=0;row<boardRows;row++)
+    {
+        cout<<setw(2)<<setfill('0')<<row<<"  ";
+        cout<<setfill(' ');
+        for(int column=0;column<boardColumns;column++)
+        {
+            cout<<(grid[row][column]?'#':'.');
+        }
+        cout<<'\n';
+    }
+
+    cout<<"\nDetected NEXT queue (top to bottom)\n";
+    for(size_t i=0;i<queue.size() && i<queueColors.size();i++)
+    {
+        const color& sampled=queueColors[i];
+        cout<<i<<": "<<queue[i].type
+            <<"  RGB=("<<sampled.R<<", "<<sampled.G<<", "<<sampled.B<<")"
+            <<"  distance="<<getColorDistance(sampled,queue[i].c)<<'\n';
+    }
+    cout<<"=== END DEBUG SNAPSHOT ===\n"<<endl;
+}
 void actuallyPutThePiece(int pos,int rotateCount)
 {
     //4 is the default position of all pieces
@@ -349,37 +679,33 @@ void actuallyPutThePiece(int pos,int rotateCount)
     {
         pressKey('Z');
         rotateCount=0;
-        Sleep(delayPress);
+        Sleep(inputDelayMs);
     }
     if(rotateCount == 2)
     {
         pressKey('A');
         rotateCount=0;
-        Sleep(delayPress);
+        Sleep(inputDelayMs);
     }
     while(rotateCount>0)
     {
         pressKey(VK_UP);
         rotateCount--;
-        Sleep(delayPress);
+        Sleep(inputDelayMs);
     }
     while(curPos>pos)
     {
         pressKey(VK_LEFT);
         curPos--;
-        Sleep(delayPress);
+        Sleep(inputDelayMs);
     }
     while(curPos<pos)
     {
         pressKey(VK_RIGHT);
         curPos++;
-        Sleep(delayPress);
+        Sleep(inputDelayMs);
     }
     pressKey(VK_SPACE);
-    //this needs to be bigger, to give time for capture
-    Sleep(100);
-
-
 }
 
 ///SOME heuritics for score
@@ -586,19 +912,9 @@ bool cmp(array<int,3>&a,array<int,3>&b)
 }
 array<int,3> getBestPosIterative(Piece p)
 {
-    array<int,3>best = {0,0,(int)1e9};
-    array<int,3>cur;
-    for(maxDepth=realMaxDepth;maxDepth<=realMaxDepth;maxDepth++)
-    {
-        retV.clear();
-        auto start = std::chrono::high_resolution_clock::now();
-        cur=getBestPos(p,0);
-        auto end = std::chrono::high_resolution_clock::now();
-        auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-        //cout<<maxDepth<<" "<<duration_ms.count()<<endl;
-        if(cmp(best,cur)==0)best=cur;
-    }
-    return best;
+    maxDepth=realMaxDepth;
+    retV.clear();
+    return getBestPos(p,0);
 }
 vector<pair<int,int>>movesForPiece[7];
 void preCompMoves()
@@ -702,9 +1018,45 @@ double dp(int depth)
     }
     return ret;
 }
-int main() {
+int runBot(int argc,char* argv[]) {
     ios_base::sync_with_stdio(0);
     cin.tie(0);
+    bool debugMode=false;
+    bool inspectOnly=false;
+    for(int i=1;i<argc;i++)
+    {
+        string argument=argv[i];
+        if(argument=="--debug")
+        {
+            debugMode=true;
+        }
+        else if(argument=="--inspect")
+        {
+            debugMode=true;
+            inspectOnly=true;
+        }
+        else if(argument=="--help")
+        {
+            cout<<"Usage: color.exe [--debug | --inspect]\n"
+                <<"  --debug    Run the bot and log every captured state.\n"
+                <<"  --inspect  Capture and log one state without playing.\n";
+            return 0;
+        }
+        else
+        {
+            cerr<<"Unknown option: "<<argument<<"\nUse --help to list options."<<endl;
+            return 1;
+        }
+    }
+    string layoutError;
+    const auto layoutPath=defaultScreenLayoutPath();
+    if(!loadScreenLayout(layoutPath,screenLayout,layoutError))
+    {
+        cerr<<layoutError<<'\n';
+        cerr<<"Build and run calibrate.cpp before starting the bot."<<endl;
+        return 1;
+    }
+    configureCaptureRegion();
     vector<int>zeros(11,0);
     for(int i=0;i<21;i++)grid.push_back(zeros);
     for(int j=0;j<10;j++)
@@ -765,39 +1117,48 @@ int main() {
     
     if (!pPixels) {
         std::cerr << "Failed to create DIB section" << std::endl;
+        cleanupCapture();
         return -1;
     }
-    cout<<"HI"<<endl;
-    double milliseconds = 0;
-    
-    int c=0;
-    //This is for starting the game
+    cout<<(inspectOnly?"Inspection mode.":"Bot ready.")<<endl;
+    cout<<"Press P when the game is visible and ready."<<endl;
     while (true) {
         if (GetAsyncKeyState(0x50) & 0x8000) {
-            cout<<"Starting game.."<<endl;;
+            cout<<(inspectOnly?"Capturing inspection frame...":"Starting game...")<<endl;
             cout.flush();
             break;
         }
-        Sleep(50); // small delay so CPU isn't 100% busy
+        Sleep(inputPollingDelayMs);
     }
-    capture(); 
-    save_pic();
+    capture();
     load_grid();
-    curQueue = getQueue();
+    vector<color>queueColors;
+    curQueue=getQueue(&queueColors);
+    if(debugMode)
+    {
+        printDebugSnapshot("initial capture",curQueue,queueColors);
+    }
+    if(inspectOnly)
+    {
+        cleanupCapture();
+        return 0;
+    }
     //I need to put a piece first before bot taking over
     while (true) {
         if (GetAsyncKeyState(VK_SPACE) & 0x8000) {
-            Sleep(200);
+            Sleep(screenUpdateDelayMs);
             break;
         }
-        Sleep(50);
+        Sleep(inputPollingDelayMs);
     }
-    capture();    
+    curPiece=curQueue[0];
+    capture();
     load_grid();
-    save_pic();
-    ///REMEMBER that you swapped those becaues of custom game rules
-    curQueue = getQueue();
-    curPiece = curQueue[0];
+    curQueue=getQueue(&queueColors);
+    if(debugMode)
+    {
+        printDebugSnapshot("after manual first placement",curQueue,queueColors,curPiece.type);
+    }
     /*
         Flow of logic should be something like
 
@@ -805,9 +1166,7 @@ int main() {
         2. put piece in that place
         3. get new statep
     */
-    int cur=1;
     int cur_move=1;
-    double avg_time = 0,avg_count=0;
     while (1) 
     {   
         //if I press P stop the bot (fail safe instead of ctrl c from terminal)
@@ -815,17 +1174,16 @@ int main() {
             cout<<"done!"<<endl;
             break;
         }
-        cout<<curPiece.type<<endl;
+        auto cycleStart=std::chrono::steady_clock::now();
+        char playedPiece=curPiece.type;
+        benchmarkStats.beginStage("board preparation");
         clear_all_grid();
+        double preparationMs=benchmarkStats.finishStage(benchmarkStats.boardPreparation);
 
         //1
-        auto start = std::chrono::high_resolution_clock::now();
-    
-        array<int,3>best_play = getBestPosIterative(curPiece);
-        
-        auto end = std::chrono::high_resolution_clock::now();
-        auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-        double time1 = duration_ms.count();
+        benchmarkStats.beginStage("search");
+        array<int,3>best_play=getBestPosIterative(curPiece);
+        double searchMs=benchmarkStats.finishStage(benchmarkStats.search);
        /* for(int i=0;i<retV.size();i++)
         {
             cout<<"algo1: "<<retV[i][0]<<" "<<retV[i][1]<<" "<<retV[i][2]<<endl;
@@ -848,23 +1206,22 @@ int main() {
         double time2 = duration_ms.count();*/
 
 
-        cout<<"move:"<<cur_move++<<"\n time spent first algo:"<<time1<<endl;//" time2: "<<time2<<endl;
-        
+        int moveNumber=cur_move++;
         /*for(int i=0;i<20;i++)
         {
             for(int j=0;j<10;j++)cout<<grid[i][j]<<" ";
             cout<<endl;
         }*/
         //cout<<endl;
-        cout<<"best move: ";
-        cout<<best_play[0]<<" "<<best_play[1]<<"\nbest score: "<<best_play[2]<<endl;
-        //cout<<"best move 2: "<<best_play2[0]<<" "<<best_play2[1]<<" score: "<<best_play2[2]<<endl;;
-        avg_time+=duration_ms.count();
-        avg_count++;
-        pushPiece(getLowestRow(best_play[0],best_play[1],curPiece),best_play[0],best_play[1],curPiece);
-        debugScore=1;
-        cout<<"score: "<<getScoreOfGrid()<<endl;
-        debugScore=0;
+        if(debugMode)
+        {
+            benchmarkStats.beginStage("debug verification");
+            pushPiece(getLowestRow(best_play[0],best_play[1],curPiece),best_play[0],best_play[1],curPiece);
+            debugScore=1;
+            cout<<"score after chosen move: "<<getScoreOfGrid()<<endl;
+            debugScore=0;
+            benchmarkStats.activeStage.clear();
+        }
         
         
         
@@ -872,25 +1229,87 @@ int main() {
 
 
         //2
+        benchmarkStats.beginStage("placement input");
         actuallyPutThePiece(best_play[0],best_play[1]);
+        double placementInputMs=benchmarkStats.finishStage(benchmarkStats.placementInput);
+
+        benchmarkStats.beginStage("render wait");
+        Sleep(screenUpdateDelayMs);
+        double renderWaitMs=benchmarkStats.finishStage(benchmarkStats.renderWait);
 
 
 
         //3 (done)
+        benchmarkStats.beginStage("screen capture");
         capture();
+        double captureMs=benchmarkStats.finishStage(benchmarkStats.screenCapture);
+
+        benchmarkStats.beginStage("grid read");
         load_grid();
+        double gridReadMs=benchmarkStats.finishStage(benchmarkStats.gridRead);
         curPiece=curQueue[0];
-        curQueue=getQueue();        
-        //break;
-        
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+
+        benchmarkStats.beginStage("queue read");
+        curQueue=getQueue(&queueColors);
+        double queueReadMs=benchmarkStats.finishStage(benchmarkStats.queueRead);
+        double lookingMs=captureMs+gridReadMs+queueReadMs;
+        double placingMs=placementInputMs+renderWaitMs;
+        benchmarkStats.lookingTotal.add(lookingMs);
+        benchmarkStats.placingTotal.add(placingMs);
+        if(debugMode)
+        {
+            printDebugSnapshot(
+                "after bot move "+to_string(cur_move-1),
+                curQueue,
+                queueColors,
+                curPiece.type
+            );
+        }
+        double cycleMs=std::chrono::duration<double,std::milli>(
+            std::chrono::steady_clock::now()-cycleStart
+        ).count();
+        benchmarkStats.fullCycle.add(cycleMs);
+        cout<<fixed<<setprecision(3);
+        cout<<"move: "<<moveNumber<<"  piece: "<<playedPiece
+            <<"  position: "<<best_play[0]<<"  rotation: "<<best_play[1]
+            <<"  score: "<<best_play[2]<<'\n';
+        cout<<"prepare: "<<preparationMs<<" ms"
+            <<"  search: "<<searchMs<<" ms"
+            <<"  placing: "<<placingMs<<" ms"
+            <<"  looking: "<<lookingMs<<" ms\n";
+        cout<<"  input: "<<placementInputMs<<" ms"
+            <<"  render wait: "<<renderWaitMs<<" ms"
+            <<"  capture: "<<captureMs<<" ms"
+            <<"  grid: "<<gridReadMs<<" ms"
+            <<"  queue: "<<queueReadMs<<" ms\n";
+        cout<<"full cycle: "<<cycleMs<<" ms"
+            <<" ("<<(1000.0/cycleMs)<<" pieces/s)"<<endl;
     }
-    cout<<"average time per move: ";
-    cout<<fixed<<setprecision(4)<<avg_time/avg_count<<endl;
-    
-    DeleteObject(hBitmap);
-    DeleteDC(hMemoryDC);
-    ReleaseDC(NULL, hScreenDC);
+    benchmarkStats.printSummary("stopped by user");
+    cleanupCapture();
 
     return 0;
+}
+
+int main(int argc,char* argv[])
+{
+    SetProcessDPIAware();
+    try
+    {
+        return runBot(argc,argv);
+    }
+    catch(const exception& error)
+    {
+        cerr<<"\nFatal bot error: "<<error.what()<<'\n';
+        benchmarkStats.printSummary(string("failure: ")+error.what());
+        cleanupCapture();
+        return 1;
+    }
+    catch(...)
+    {
+        cerr<<"\nFatal bot error: unknown exception\n";
+        benchmarkStats.printSummary("failure: unknown exception");
+        cleanupCapture();
+        return 1;
+    }
 }

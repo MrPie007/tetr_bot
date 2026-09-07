@@ -31,5 +31,7 @@
 *.out
 *.app
 *.bmp
+screen_layout.cfg
+benchmark_results.csv
 .vscode/tasks.json
 .vscode/settings.json

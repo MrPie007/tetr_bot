@@ -39,6 +39,9 @@ To inspect one frame without letting the bot play, run:
 Press `P` once the game is visible. The program saves the exact captured pixels
 as `debug_capture_0.bmp`, prints the detected 20 x 10 grid using `#` and `.`, and
 prints the detected `NEXT` queue with the sampled RGB value for every slot.
+Queue colors are matched by chromaticity rather than raw brightness, so the
+same piece is recognized consistently across the preview's highlights,
+shadows, and locked-block shading.
 
 To run the bot while saving and printing every captured state, use:
 
@@ -48,15 +51,43 @@ To run the bot while saving and printing every captured state, use:
 
 Debug captures are written next to `color.exe` and are ignored by Git.
 
+At game startup, the board reader detects the wide yellow `GO!` overlay and
+ignores its yellow samples. You can press the first hard drop while `GO!` is
+still visible instead of waiting for it to disappear. Detection permanently
+turns off as soon as the overlay is absent, preventing yellow blocks later in
+the game from being mistaken for another startup overlay. If no `GO!` appears,
+the detector disables itself on the first capture and normal play is unchanged.
+
+## Placement evaluation
+
+Candidate boards are scored for aggregate and maximum height, surface
+bumpiness, holes, the depth of blocks burying those holes, wells, and row and
+column transitions. Height above row 12 receives an additional nonlinear
+danger penalty. Line clears use a bounded reward so the solver does not create
+holes merely to chase a Tetris. Every intermediate lookahead placement also
+receives a large immediate hole penalty, so a hole that the following piece
+could theoretically repair is still avoided whenever a clean move exists.
+
 ## Speed testing
 
 The bot is currently configured to search the current piece plus one queued
 piece. All rotation, movement, and hard-drop key-down/key-up events for a move
-are submitted as one ordered `SendInput` batch without per-key sleeps. Capture
-then polls at 1 ms intervals until the detected `NEXT` queue has actually
-advanced, instead of relying on a fixed render delay. A high-resolution Windows
-timer prevents short waits from being rounded to roughly 15 ms. The previous
-one-second loop delay has been removed.
+are submitted in one `SendInput` batch with no artificial hold or settling
+delay. Capture polls at 1 ms intervals until the detected `NEXT` queue has
+actually advanced, then accepts that first updated frame. Each slot is sampled
+through its central vertical band so adjacent previews crossing slot boundaries
+during animation are ignored. A high-resolution Windows timer prevents short
+waits from being rounded to roughly 15 ms. The previous one-second loop delay
+has been removed.
+
+After each move, the captured board is compared with the board predicted by the
+solver (excluding the active piece's spawn rows). A mismatch is printed
+immediately. Every mismatch is appended to `placement_mismatches.csv`, including
+the planned piece, position, rotation, queue, and expected and captured boards.
+The first five mismatch images are also saved with those choices in the
+filename (for example, `placement_mismatch_move_42_O_x2_r0_diff4.bmp`).
+The final benchmark summary reports mismatch counts and percentages separately
+for every tetromino type.
 
 Run without `--debug` when benchmarking. Each move reports fractional search
 time, full capture-to-capture cycle time, and instantaneous pieces per second.

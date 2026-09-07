@@ -52,7 +52,7 @@ BITMAPINFO bmi;
 HBITMAP hBitmap;
 
 constexpr int queuedPiecesToLookAhead=1;
-constexpr DWORD inputDelayMs=2;
+constexpr DWORD inputDelayMs=0;
 constexpr DWORD screenUpdateDelayMs=20;
 constexpr DWORD inputPollingDelayMs=4;
 int maxDepth=queuedPiecesToLookAhead;
@@ -265,21 +265,38 @@ Piece all_p[7]={IPiece,JPiece,LPiece,OPiece,ZPiece,SPiece,TPiece};
 char all_pc[7]={'I','J','L','O','Z','S','T'};
 Piece curPiece=IPiece;
 
-void pressKey(WORD keyCode) {
-    INPUT ip;
-    ip.type = INPUT_KEYBOARD;
-    ip.ki.wScan = 0;
-    ip.ki.time = 0;
-    ip.ki.dwExtraInfo = 0;
+void appendKeyPress(vector<INPUT>& events,WORD keyCode)
+{
+    INPUT keyDown{};
+    keyDown.type=INPUT_KEYBOARD;
+    keyDown.ki.wVk=keyCode;
+    events.push_back(keyDown);
 
-    // Key press
-    ip.ki.wVk = keyCode;     
-    ip.ki.dwFlags = 0;      
-    SendInput(1, &ip, sizeof(INPUT));
+    INPUT keyUp=keyDown;
+    keyUp.ki.dwFlags=KEYEVENTF_KEYUP;
+    events.push_back(keyUp);
+}
+void sendKeySequence(const vector<WORD>& keyCodes)
+{
+    vector<INPUT> events;
+    events.reserve(keyCodes.size()*2);
+    for(WORD keyCode:keyCodes)
+    {
+        appendKeyPress(events,keyCode);
+    }
 
-    // Key release
-    ip.ki.dwFlags = KEYEVENTF_KEYUP; 
-    SendInput(1, &ip, sizeof(INPUT));
+    UINT sent=SendInput(
+        static_cast<UINT>(events.size()),
+        events.data(),
+        sizeof(INPUT)
+    );
+    if(sent!=events.size())
+    {
+        ostringstream error;
+        error<<"SendInput queued "<<sent<<" of "<<events.size()
+             <<" keyboard events (Windows error "<<GetLastError()<<")";
+        throw runtime_error(error.str());
+    }
 }
 
 void capture()
@@ -669,43 +686,39 @@ void printDebugSnapshot(
     }
     cout<<"=== END DEBUG SNAPSHOT ===\n"<<endl;
 }
-void actuallyPutThePiece(int pos,int rotateCount)
+size_t actuallyPutThePiece(int pos,int rotateCount)
 {
-    //4 is the default position of all pieces
-    //TODO(done), implement the ability to rotate
-    //TODO(done), add the coordinates of rotated pieces for each piece
+    vector<WORD> keyCodes;
+    keyCodes.reserve(8);
     int curPos=4;
     if(rotateCount == 3)
     {
-        pressKey('Z');
+        keyCodes.push_back('Z');
         rotateCount=0;
-        Sleep(inputDelayMs);
     }
     if(rotateCount == 2)
     {
-        pressKey('A');
+        keyCodes.push_back('A');
         rotateCount=0;
-        Sleep(inputDelayMs);
     }
     while(rotateCount>0)
     {
-        pressKey(VK_UP);
+        keyCodes.push_back(VK_UP);
         rotateCount--;
-        Sleep(inputDelayMs);
     }
     while(curPos>pos)
     {
-        pressKey(VK_LEFT);
+        keyCodes.push_back(VK_LEFT);
         curPos--;
-        Sleep(inputDelayMs);
     }
     while(curPos<pos)
     {
-        pressKey(VK_RIGHT);
+        keyCodes.push_back(VK_RIGHT);
         curPos++;
-        Sleep(inputDelayMs);
     }
-    pressKey(VK_SPACE);
+    keyCodes.push_back(VK_SPACE);
+    sendKeySequence(keyCodes);
+    return keyCodes.size();
 }
 
 ///SOME heuritics for score
@@ -1230,7 +1243,7 @@ int runBot(int argc,char* argv[]) {
 
         //2
         benchmarkStats.beginStage("placement input");
-        actuallyPutThePiece(best_play[0],best_play[1]);
+        size_t keyPressCount=actuallyPutThePiece(best_play[0],best_play[1]);
         double placementInputMs=benchmarkStats.finishStage(benchmarkStats.placementInput);
 
         benchmarkStats.beginStage("render wait");
@@ -1272,7 +1285,8 @@ int runBot(int argc,char* argv[]) {
         cout<<fixed<<setprecision(3);
         cout<<"move: "<<moveNumber<<"  piece: "<<playedPiece
             <<"  position: "<<best_play[0]<<"  rotation: "<<best_play[1]
-            <<"  score: "<<best_play[2]<<'\n';
+            <<"  score: "<<best_play[2]
+            <<"  keys: "<<keyPressCount<<'\n';
         cout<<"prepare: "<<preparationMs<<" ms"
             <<"  search: "<<searchMs<<" ms"
             <<"  placing: "<<placingMs<<" ms"

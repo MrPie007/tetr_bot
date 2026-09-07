@@ -7,6 +7,7 @@ Build the calibration tool and the bot with MinGW-w64:
 ```powershell
 g++ -std=c++17 -O2 calibrate.cpp -o calibrate.exe -lgdi32
 g++ -std=c++17 -O2 color.cpp -o color.exe -lgdi32
+g++ -std=c++17 -O2 solver_eval.cpp -o solver_eval.exe -lgdi32
 ```
 
 The default VS Code build task uses these compiler and linker settings for the
@@ -67,6 +68,25 @@ danger penalty. Line clears use a bounded reward so the solver does not create
 holes merely to chase a Tetris. Every intermediate lookahead placement also
 receives a large immediate hole penalty, so a hole that the following piece
 could theoretically repair is still avoided whenever a clean move exists.
+
+## Automated solver evaluation
+
+`solver_eval.exe` runs the production solver without capturing the screen or
+sending keyboard input. It generates deterministic seven-bag queues, asks the
+same `getBestPosIterative` function for each move, applies the selected piece,
+and measures survival, line clears, holes, stack height, and search latency.
+
+For a comparison run:
+
+```powershell
+.\solver_eval.exe --games 10 --max-pieces 2000 --lookahead 1 --seed 2 --label baseline
+```
+
+The same seed produces the same independent game sequences. Increase
+`--max-pieces` when games regularly reach the cap; a capped game has not topped
+out and therefore does not establish its true survival length. Results are
+appended to `solver_eval_results.csv`. Use `--no-csv` for temporary runs and
+`--help` to see all options.
 
 ## Speed testing
 

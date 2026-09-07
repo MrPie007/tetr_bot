@@ -34,5 +34,6 @@
 screen_layout.cfg
 benchmark_results.csv
 placement_mismatches.csv
+solver_eval_results.csv
 .vscode/tasks.json
 .vscode/settings.json

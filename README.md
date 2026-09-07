@@ -79,7 +79,7 @@ and measures survival, line clears, holes, stack height, and search latency.
 For a comparison run:
 
 ```powershell
-.\solver_eval.exe --games 10 --max-pieces 2000 --lookahead 1 --seed 2 --label baseline
+.\solver_eval.exe --games 16 --max-pieces 2000 --lookahead 1 --seed 2 --threads 16 --label baseline
 ```
 
 The same seed produces the same independent game sequences. Increase
@@ -87,6 +87,13 @@ The same seed produces the same independent game sequences. Increase
 out and therefore does not establish its true survival length. Results are
 appended to `solver_eval_results.csv`. Use `--no-csv` for temporary runs and
 `--help` to see all options.
+
+Games run in parallel, process-isolated workers so the production solver's
+global board and recursion state cannot race between games. `--threads 0`, the
+default, automatically uses up to the machine's logical CPU count or the number
+of games, whichever is smaller. Use `--threads 1` for a serial baseline. The
+summary reports both per-worker solver throughput and actual parallel
+wall-clock throughput, and stores the worker count in the CSV.
 
 ## Speed testing
 

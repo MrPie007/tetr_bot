@@ -5,9 +5,11 @@ struct EvaluationOptions {
     int games=10;
     int maxPieces=2000;
     int lookahead=queuedPiecesToLookAhead;
+    int threads=0;
     uint32_t seed=2;
     string label="default";
     filesystem::path csvPath=executableDirectory()/"solver_eval_results.csv";
+    optional<filesystem::path> workerResultPath;
     bool writeCsv=true;
     bool quiet=false;
 };
@@ -74,7 +76,9 @@ void printEvaluationUsage()
         <<"Usage: solver_eval.exe [options]\n"
         <<"  --games N         Number of independent games (default: 10)\n"
         <<"  --max-pieces N    Stop each game after N pieces (default: 2000)\n"
-        <<"  --lookahead N     Queued pieces searched, from 0 to 4 (default: 1)\n"
+        <<"  --lookahead N     Queued pieces searched, from 0 to 4 (default: "
+        <<queuedPiecesToLookAhead<<")\n"
+        <<"  --threads N       Parallel game workers; 0 selects automatically (default: 0)\n"
         <<"  --seed N          Base seven-bag seed (default: 2)\n"
         <<"  --label TEXT      Version label stored in the CSV summary\n"
         <<"  --csv PATH        Summary CSV path\n"
@@ -133,6 +137,15 @@ EvaluationOptions parseEvaluationOptions(int argc,char* argv[])
         {
             options.lookahead=static_cast<int>(parseUnsignedArgument(requireValue(),argument));
         }
+        else if(argument=="--threads")
+        {
+            uint64_t threads=parseUnsignedArgument(requireValue(),argument);
+            if(threads>static_cast<uint64_t>(numeric_limits<int>::max()))
+            {
+                throw invalid_argument("--threads is too large");
+            }
+            options.threads=static_cast<int>(threads);
+        }
         else if(argument=="--seed")
         {
             uint64_t seed=parseUnsignedArgument(requireValue(),argument);
@@ -149,6 +162,10 @@ EvaluationOptions parseEvaluationOptions(int argc,char* argv[])
         else if(argument=="--csv")
         {
             options.csvPath=requireValue();
+        }
+        else if(argument=="--worker-result")
+        {
+            options.workerResultPath=requireValue();
         }
         else if(argument=="--no-csv")
         {
@@ -173,13 +190,21 @@ EvaluationOptions parseEvaluationOptions(int argc,char* argv[])
     return options;
 }
 
+int getWorkerCount(const EvaluationOptions& options)
+{
+    unsigned int available=thread::hardware_concurrency();
+    int requested=options.threads>0
+        ?options.threads
+        :static_cast<int>(available==0?1:available);
+    return max(1,min(options.games,requested));
+}
+
 void resetSolverState()
 {
     grid.assign(boardRows,vector<int>(boardColumns,0));
     firstInCol.assign(boardColumns,0);
     curQueue.clear();
     retV.clear();
-    placements.clear();
     while(!grids.empty()) grids.pop();
     while(!firstInCols.empty()) firstInCols.pop();
 }
@@ -237,6 +262,148 @@ GameResult evaluateGame(const EvaluationOptions& options,uint32_t gameSeed)
     return result;
 }
 
+void writeWorkerResult(const filesystem::path& path,const GameResult& result)
+{
+    ofstream output(path,ios::trunc);
+    if(!output)
+    {
+        throw runtime_error("Could not create worker result: "+path.string());
+    }
+    output<<"TETR_SOLVER_EVAL_V1\n"<<setprecision(17)
+          <<result.seed<<' '<<result.pieces<<' '<<result.lines<<' '
+          <<result.lineClears<<' '<<result.tetrises<<' '
+          <<result.holeCreatingMoves<<' '<<result.holeSamples<<' '
+          <<result.finalHoles<<' '<<result.maximumHoles<<' '
+          <<result.maximumHeight<<' '<<result.toppedOut<<'\n';
+    for(size_t count:result.pieceCounts) output<<count<<' ';
+    output<<'\n'<<result.searchTime.samples.size()<<'\n';
+    for(double sample:result.searchTime.samples) output<<sample<<'\n';
+    if(!output)
+    {
+        throw runtime_error("Could not finish worker result: "+path.string());
+    }
+}
+
+GameResult readWorkerResult(const filesystem::path& path)
+{
+    ifstream input(path);
+    if(!input)
+    {
+        throw runtime_error("Worker result is missing: "+path.string());
+    }
+    string version;
+    input>>version;
+    if(version!="TETR_SOLVER_EVAL_V1")
+    {
+        throw runtime_error("Worker result has an unsupported format: "+path.string());
+    }
+
+    GameResult result;
+    int toppedOut=0;
+    input>>result.seed>>result.pieces>>result.lines
+         >>result.lineClears>>result.tetrises>>result.holeCreatingMoves
+         >>result.holeSamples>>result.finalHoles>>result.maximumHoles
+         >>result.maximumHeight>>toppedOut;
+    result.toppedOut=toppedOut!=0;
+    for(size_t& count:result.pieceCounts) input>>count;
+    size_t sampleCount=0;
+    input>>sampleCount;
+    result.searchTime.samples.resize(sampleCount);
+    for(double& sample:result.searchTime.samples) input>>sample;
+    if(!input)
+    {
+        throw runtime_error("Worker result is incomplete: "+path.string());
+    }
+    return result;
+}
+
+filesystem::path currentExecutablePath()
+{
+    vector<wchar_t> buffer(32768);
+    DWORD length=GetModuleFileNameW(
+        nullptr,buffer.data(),static_cast<DWORD>(buffer.size())
+    );
+    if(length==0 || length>=buffer.size())
+    {
+        throw runtime_error("Could not determine evaluator executable path");
+    }
+    return filesystem::path(wstring(buffer.data(),length));
+}
+
+wstring quoteWindowsArgument(const wstring& value)
+{
+    // File paths cannot contain a quote, and all other internal arguments are
+    // decimal numbers, so surrounding quotes are sufficient here.
+    return L"\""+value+L"\"";
+}
+
+GameResult evaluateGameInChildProcess(
+    const EvaluationOptions& options,
+    int gameIndex
+)
+{
+    uint32_t gameSeed=options.seed
+        +static_cast<uint32_t>(gameIndex)*0x9E3779B9u;
+    filesystem::path executable=currentExecutablePath();
+    filesystem::path resultPath=filesystem::temp_directory_path()/(
+        "tetr_solver_eval_"+to_string(GetCurrentProcessId())+'_'+
+        to_string(gameIndex)+".result"
+    );
+
+    wostringstream command;
+    command<<quoteWindowsArgument(executable.wstring())
+           <<L" --max-pieces "<<options.maxPieces
+           <<L" --lookahead "<<options.lookahead
+           <<L" --seed "<<gameSeed
+           <<L" --worker-result "<<quoteWindowsArgument(resultPath.wstring());
+    wstring commandLine=command.str();
+    vector<wchar_t> mutableCommand(commandLine.begin(),commandLine.end());
+    mutableCommand.push_back(L'\0');
+
+    STARTUPINFOW startup{};
+    startup.cb=sizeof(startup);
+    PROCESS_INFORMATION process{};
+    BOOL created=CreateProcessW(
+        executable.c_str(),mutableCommand.data(),nullptr,nullptr,FALSE,0,
+        nullptr,nullptr,&startup,&process
+    );
+    if(!created)
+    {
+        throw runtime_error(
+            "Could not start evaluator worker (Windows error "+
+            to_string(GetLastError())+")"
+        );
+    }
+
+    WaitForSingleObject(process.hProcess,INFINITE);
+    DWORD exitCode=1;
+    GetExitCodeProcess(process.hProcess,&exitCode);
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+
+    error_code removeError;
+    if(exitCode!=0)
+    {
+        filesystem::remove(resultPath,removeError);
+        throw runtime_error(
+            "Evaluator worker for game "+to_string(gameIndex+1)+
+            " exited with code "+to_string(exitCode)
+        );
+    }
+
+    try
+    {
+        GameResult result=readWorkerResult(resultPath);
+        filesystem::remove(resultPath,removeError);
+        return result;
+    }
+    catch(...)
+    {
+        filesystem::remove(resultPath,removeError);
+        throw;
+    }
+}
+
 string evaluationTimestamp()
 {
     time_t now=time(nullptr);
@@ -252,7 +419,8 @@ void appendEvaluationCsv(
     const vector<GameResult>& games,
     const TimingSeries& survival,
     const TimingSeries& searchTimes,
-    double wallTimeMs
+    double wallTimeMs,
+    int workerCount
 )
 {
     error_code fileError;
@@ -298,7 +466,8 @@ void appendEvaluationCsv(
             <<"top_outs,capped_games,avg_survival,median_survival,min_survival,"
             <<"max_survival,shortest_game_seed,total_lines,lines_per_piece,"
             <<"hole_creating_rate,avg_holes,max_holes,max_height,avg_search_ms,"
-            <<"p95_search_ms,max_search_ms,solver_pps,wall_time_ms\n";
+            <<"p95_search_ms,max_search_ms,solver_pps,wall_time_ms,threads,"
+            <<"parallel_pps\n";
     }
     output<<BenchmarkStats::csvEscape(evaluationTimestamp())<<','
           <<BenchmarkStats::csvEscape(options.label)<<','
@@ -312,7 +481,8 @@ void appendEvaluationCsv(
           <<maximumHoles<<','<<maximumHeight<<','<<searchTimes.average()<<','
           <<searchTimes.percentile(0.95)<<','<<searchTimes.maximum()<<','
           <<(searchTimes.total()>0?1000.0*totalPieces/searchTimes.total():0.0)<<','
-          <<wallTimeMs<<'\n';
+          <<wallTimeMs<<','<<workerCount<<','
+          <<(wallTimeMs>0?1000.0*totalPieces/wallTimeMs:0.0)<<'\n';
 }
 
 void printEvaluationSummary(
@@ -320,7 +490,8 @@ void printEvaluationSummary(
     const vector<GameResult>& games,
     const TimingSeries& survival,
     const TimingSeries& searchTimes,
-    double wallTimeMs
+    double wallTimeMs,
+    int workerCount
 )
 {
     size_t totalPieces=0;
@@ -354,6 +525,7 @@ void printEvaluationSummary(
     cout<<fixed<<setprecision(3);
     cout<<"Label: "<<options.label<<'\n';
     cout<<"Base seed: "<<options.seed<<'\n';
+    cout<<"Parallel workers: "<<workerCount<<'\n';
     cout<<"Games: "<<games.size()<<" ("<<topOuts<<" top-outs, "
         <<games.size()-topOuts<<" reached the piece cap)\n";
     cout<<"Lookahead: "<<options.lookahead<<" queued piece(s)\n";
@@ -378,6 +550,9 @@ void printEvaluationSummary(
     cout<<"Solver-only throughput: "
         <<(searchTimes.total()>0?1000.0*totalPieces/searchTimes.total():0.0)
         <<" pieces/s\n";
+    cout<<"Parallel evaluation throughput: "
+        <<(wallTimeMs>0?1000.0*totalPieces/wallTimeMs:0.0)
+        <<" pieces/s\n";
     cout<<"Evaluation wall time: "<<wallTimeMs<<" ms\n";
     cout<<"Piece distribution:";
     for(size_t index=0;index<pieceCounts.size();index++)
@@ -394,50 +569,108 @@ int main(int argc,char* argv[])
     try
     {
         EvaluationOptions options=parseEvaluationOptions(argc,argv);
-        realMaxDepth=options.lookahead;
-        maxDepth=options.lookahead;
+        if(options.workerResultPath)
+        {
+            GameResult result=evaluateGame(options,options.seed);
+            writeWorkerResult(*options.workerResultPath,result);
+            return 0;
+        }
+        int workerCount=getWorkerCount(options);
 
-        cout<<"Evaluating the production solver with deterministic seven-bag queues...\n";
+        cout<<"Evaluating the production solver with deterministic seven-bag queues "
+            <<"using "<<workerCount<<" worker(s)...\n";
         auto evaluationStart=chrono::steady_clock::now();
-        vector<GameResult> games;
-        games.reserve(options.games);
+        vector<GameResult> games(options.games);
+        atomic<int> nextGame{0};
+        atomic<int> completedGames{0};
+        atomic<bool> cancelWorkers{false};
+        mutex outputMutex;
+        mutex errorMutex;
+        exception_ptr workerError;
+
+        auto evaluateNextGame=[&]() {
+            while(!cancelWorkers.load(memory_order_relaxed))
+            {
+                int gameIndex=nextGame.fetch_add(1,memory_order_relaxed);
+                if(gameIndex>=options.games) return;
+                try
+                {
+                    uint32_t gameSeed=options.seed
+                        +static_cast<uint32_t>(gameIndex)*0x9E3779B9u;
+                    games[gameIndex]=workerCount==1
+                        ?evaluateGame(options,gameSeed)
+                        :evaluateGameInChildProcess(options,gameIndex);
+                    int completed=completedGames.fetch_add(1,memory_order_relaxed)+1;
+
+                    if(!options.quiet)
+                    {
+                        lock_guard<mutex> outputLock(outputMutex);
+                        const GameResult& game=games[gameIndex];
+                        cout<<"Game "<<gameIndex+1<<'/'<<options.games
+                            <<"  completed="<<completed<<'/'<<options.games
+                            <<"  seed="<<game.seed
+                            <<"  pieces="<<game.pieces
+                            <<"  lines="<<game.lines
+                            <<"  max height="<<game.maximumHeight
+                            <<"  max holes="<<game.maximumHoles
+                            <<"  status="<<(game.toppedOut?"top-out":"piece cap")
+                            <<'\n';
+                    }
+                }
+                catch(...)
+                {
+                    {
+                        lock_guard<mutex> errorLock(errorMutex);
+                        if(!workerError) workerError=current_exception();
+                    }
+                    cancelWorkers.store(true,memory_order_relaxed);
+                    return;
+                }
+            }
+        };
+
+        vector<thread> workers;
+        if(workerCount==1)
+        {
+            evaluateNextGame();
+        }
+        else
+        {
+            workers.reserve(workerCount);
+            for(int index=0;index<workerCount;index++)
+            {
+                workers.emplace_back(evaluateNextGame);
+            }
+            for(thread& worker:workers)
+            {
+                worker.join();
+            }
+        }
+        if(workerError) rethrow_exception(workerError);
+
         TimingSeries survival;
         TimingSeries searchTimes;
-
-        for(int gameIndex=0;gameIndex<options.games;gameIndex++)
+        for(const GameResult& game:games)
         {
-            uint32_t gameSeed=options.seed
-                +static_cast<uint32_t>(gameIndex)*0x9E3779B9u;
-            GameResult result=evaluateGame(options,gameSeed);
-            survival.add(static_cast<double>(result.pieces));
+            survival.add(static_cast<double>(game.pieces));
             searchTimes.samples.insert(
                 searchTimes.samples.end(),
-                result.searchTime.samples.begin(),
-                result.searchTime.samples.end()
+                game.searchTime.samples.begin(),
+                game.searchTime.samples.end()
             );
-            games.push_back(result);
-
-            if(!options.quiet)
-            {
-                const GameResult& game=games.back();
-                cout<<"Game "<<gameIndex+1<<'/'<<options.games
-                    <<"  seed="<<game.seed
-                    <<"  pieces="<<game.pieces
-                    <<"  lines="<<game.lines
-                    <<"  max height="<<game.maximumHeight
-                    <<"  max holes="<<game.maximumHoles
-                    <<"  status="<<(game.toppedOut?"top-out":"piece cap")
-                    <<'\n';
-            }
         }
 
         double wallTimeMs=chrono::duration<double,milli>(
             chrono::steady_clock::now()-evaluationStart
         ).count();
-        printEvaluationSummary(options,games,survival,searchTimes,wallTimeMs);
+        printEvaluationSummary(
+            options,games,survival,searchTimes,wallTimeMs,workerCount
+        );
         if(options.writeCsv)
         {
-            appendEvaluationCsv(options,games,survival,searchTimes,wallTimeMs);
+            appendEvaluationCsv(
+                options,games,survival,searchTimes,wallTimeMs,workerCount
+            );
             cout<<"Summary appended to "<<options.csvPath.string()<<'\n';
         }
         return 0;

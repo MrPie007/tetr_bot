@@ -50,10 +50,13 @@ HDC hScreenDC;
 HDC hMemoryDC;
 BITMAPINFO bmi;
 HBITMAP hBitmap;
+HANDLE highResolutionTimer;
 
 constexpr int queuedPiecesToLookAhead=1;
 constexpr DWORD inputDelayMs=0;
-constexpr DWORD screenUpdateDelayMs=20;
+constexpr DWORD screenUpdateDelayMs=1;
+constexpr DWORD initialScreenUpdateDelayMs=20;
+constexpr DWORD screenUpdateTimeoutMs=100;
 constexpr DWORD inputPollingDelayMs=4;
 int maxDepth=queuedPiecesToLookAhead;
 int realMaxDepth=queuedPiecesToLookAhead;
@@ -61,6 +64,7 @@ constexpr int boardColumns=10;
 constexpr int boardRows=20;
 constexpr int queueLength=5;
 constexpr int cellSampleRadius=1;
+constexpr int queuePixelStride=2;
 ScreenLayout screenLayout;
 int x=0;
 int y=0;
@@ -298,6 +302,28 @@ void sendKeySequence(const vector<WORD>& keyCodes)
         throw runtime_error(error.str());
     }
 }
+void preciseWait(DWORD milliseconds)
+{
+    if(milliseconds==0) return;
+    if(highResolutionTimer)
+    {
+        LARGE_INTEGER dueTime{};
+        dueTime.QuadPart=-static_cast<LONGLONG>(milliseconds)*10000;
+        if(SetWaitableTimer(highResolutionTimer,&dueTime,0,nullptr,nullptr,FALSE))
+        {
+            WaitForSingleObject(highResolutionTimer,INFINITE);
+            return;
+        }
+    }
+    Sleep(milliseconds);
+}
+void waitForKeyRelease(int virtualKey)
+{
+    while(GetAsyncKeyState(virtualKey)&0x8000)
+    {
+        preciseWait(1);
+    }
+}
 
 void capture()
 {
@@ -330,9 +356,24 @@ void init()
     
     hBitmap = CreateDIBSection(hMemoryDC, &bmi, DIB_RGB_COLORS, &pPixels, NULL, 0);
     SelectObject(hMemoryDC, hBitmap);
+    highResolutionTimer=CreateWaitableTimerExW(
+        nullptr,
+        nullptr,
+        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+        TIMER_ALL_ACCESS
+    );
+    if(!highResolutionTimer)
+    {
+        highResolutionTimer=CreateWaitableTimerW(nullptr,FALSE,nullptr);
+    }
 }
 void cleanupCapture()
 {
+    if(highResolutionTimer)
+    {
+        CloseHandle(highResolutionTimer);
+        highResolutionTimer=nullptr;
+    }
     if(hMemoryDC)
     {
         DeleteDC(hMemoryDC);
@@ -415,9 +456,9 @@ color getRepresentativePieceColor(int tx,int ty,int bx,int by)
 {
     color bestColor(0,0,0);
     int bestDistance=numeric_limits<int>::max();
-    for(int px=tx;px<=bx;px++)
+    for(int px=tx;px<=bx;px+=queuePixelStride)
     {
-        for(int py=ty;py<=by;py++)
+        for(int py=ty;py<=by;py+=queuePixelStride)
         {
             color sampledColor=getPixelRel(px,py);
             int highest=max({sampledColor.R,sampledColor.G,sampledColor.B});
@@ -482,6 +523,85 @@ vector<Piece>getQueue(vector<color>* sampledColors=nullptr)
     }
     return ret;
 
+}
+string getQueueTypes(const vector<Piece>& queue)
+{
+    string types;
+    for(const Piece& piece:queue)
+    {
+        types.push_back(piece.type);
+    }
+    return types;
+}
+bool hasQueueAdvanced(const vector<Piece>& previous,const vector<Piece>& current)
+{
+    if(previous.size()!=queueLength || current.size()!=queueLength)
+    {
+        return false;
+    }
+    for(int i=0;i+1<queueLength;i++)
+    {
+        if(current[i].type!=previous[i+1].type)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+struct UpdatedFrame {
+    vector<Piece> queue;
+    vector<color> queueColors;
+    double renderWaitMs=0;
+    double captureMs=0;
+    double queueReadMs=0;
+    int captureAttempts=0;
+};
+UpdatedFrame waitForUpdatedFrame(const vector<Piece>& previousQueue)
+{
+    UpdatedFrame result;
+    auto synchronizationStart=chrono::steady_clock::now();
+    benchmarkStats.activeStage="render synchronization";
+    benchmarkStats.activeStageStart=synchronizationStart;
+
+    while(true)
+    {
+        auto waitStart=chrono::steady_clock::now();
+        preciseWait(screenUpdateDelayMs);
+        result.renderWaitMs+=chrono::duration<double,milli>(
+            chrono::steady_clock::now()-waitStart
+        ).count();
+
+        auto captureStart=chrono::steady_clock::now();
+        capture();
+        result.captureMs+=chrono::duration<double,milli>(
+            chrono::steady_clock::now()-captureStart
+        ).count();
+        result.captureAttempts++;
+
+        auto queueStart=chrono::steady_clock::now();
+        result.queue=getQueue(&result.queueColors);
+        result.queueReadMs+=chrono::duration<double,milli>(
+            chrono::steady_clock::now()-queueStart
+        ).count();
+
+        if(hasQueueAdvanced(previousQueue,result.queue))
+        {
+            benchmarkStats.activeStage.clear();
+            return result;
+        }
+
+        double elapsed=chrono::duration<double,milli>(
+            chrono::steady_clock::now()-synchronizationStart
+        ).count();
+        if(elapsed>=screenUpdateTimeoutMs)
+        {
+            ostringstream error;
+            error<<"Timed out waiting for NEXT queue to advance after "
+                 <<elapsed<<" ms; previous="<<getQueueTypes(previousQueue)
+                 <<", last seen="<<getQueueTypes(result.queue);
+            throw runtime_error(error.str());
+        }
+    }
 }
 bool SaveBMP(const char* filename, void* pPixels, int width, int height) {
     BITMAPFILEHEADER fileHeader;
@@ -1159,7 +1279,10 @@ int runBot(int argc,char* argv[]) {
     //I need to put a piece first before bot taking over
     while (true) {
         if (GetAsyncKeyState(VK_SPACE) & 0x8000) {
-            Sleep(screenUpdateDelayMs);
+            // Do not let the first injected hard drop overlap the user's
+            // physical Space press. TETR.IO needs a fresh press edge.
+            waitForKeyRelease(VK_SPACE);
+            preciseWait(initialScreenUpdateDelayMs);
             break;
         }
         Sleep(inputPollingDelayMs);
@@ -1246,25 +1369,22 @@ int runBot(int argc,char* argv[]) {
         size_t keyPressCount=actuallyPutThePiece(best_play[0],best_play[1]);
         double placementInputMs=benchmarkStats.finishStage(benchmarkStats.placementInput);
 
-        benchmarkStats.beginStage("render wait");
-        Sleep(screenUpdateDelayMs);
-        double renderWaitMs=benchmarkStats.finishStage(benchmarkStats.renderWait);
-
-
-
-        //3 (done)
-        benchmarkStats.beginStage("screen capture");
-        capture();
-        double captureMs=benchmarkStats.finishStage(benchmarkStats.screenCapture);
+        // Poll captured frames until NEXT has actually shifted. This replaces the
+        // fixed render sleep and leaves the final successful frame in pPixels.
+        UpdatedFrame updatedFrame=waitForUpdatedFrame(curQueue);
+        double renderWaitMs=updatedFrame.renderWaitMs;
+        double captureMs=updatedFrame.captureMs;
+        double queueReadMs=updatedFrame.queueReadMs;
+        benchmarkStats.renderWait.add(renderWaitMs);
+        benchmarkStats.screenCapture.add(captureMs);
+        benchmarkStats.queueRead.add(queueReadMs);
 
         benchmarkStats.beginStage("grid read");
         load_grid();
         double gridReadMs=benchmarkStats.finishStage(benchmarkStats.gridRead);
         curPiece=curQueue[0];
-
-        benchmarkStats.beginStage("queue read");
-        curQueue=getQueue(&queueColors);
-        double queueReadMs=benchmarkStats.finishStage(benchmarkStats.queueRead);
+        curQueue=move(updatedFrame.queue);
+        queueColors=move(updatedFrame.queueColors);
         double lookingMs=captureMs+gridReadMs+queueReadMs;
         double placingMs=placementInputMs+renderWaitMs;
         benchmarkStats.lookingTotal.add(lookingMs);
@@ -1295,7 +1415,8 @@ int runBot(int argc,char* argv[]) {
             <<"  render wait: "<<renderWaitMs<<" ms"
             <<"  capture: "<<captureMs<<" ms"
             <<"  grid: "<<gridReadMs<<" ms"
-            <<"  queue: "<<queueReadMs<<" ms\n";
+            <<"  queue: "<<queueReadMs<<" ms"
+            <<"  capture attempts: "<<updatedFrame.captureAttempts<<"\n";
         cout<<"full cycle: "<<cycleMs<<" ms"
             <<" ("<<(1000.0/cycleMs)<<" pieces/s)"<<endl;
     }

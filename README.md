@@ -53,8 +53,10 @@ Debug captures are written next to `color.exe` and are ignored by Git.
 The bot is currently configured to search the current piece plus one queued
 piece. All rotation, movement, and hard-drop key-down/key-up events for a move
 are submitted as one ordered `SendInput` batch without per-key sleeps. Capture
-waits 20 ms after a hard drop so the game can render its next frame. The
-previous one-second loop delay has been removed.
+then polls at 1 ms intervals until the detected `NEXT` queue has actually
+advanced, instead of relying on a fixed render delay. A high-resolution Windows
+timer prevents short waits from being rounded to roughly 15 ms. The previous
+one-second loop delay has been removed.
 
 Run without `--debug` when benchmarking. Each move reports fractional search
 time, full capture-to-capture cycle time, and instantaneous pieces per second.

@@ -134,8 +134,10 @@ from being rounded to roughly 15 ms.
 The benchmark summary reports how often the board was resynchronized and how
 many resynchronizations corrected drift.
 
-Run without `--debug` when benchmarking. Each move reports fractional search
-time, full capture-to-capture cycle time, and instantaneous pieces per second.
+Run without `--debug` when benchmarking. Normal mode reports fractional search
+time, full capture-to-capture cycle time, and instantaneous pieces per second
+every 25 moves so Windows console rendering does not throttle the bot. Debug
+mode retains per-move output.
 The VS Code task and commands above use `-O2` optimization. Press `P` to stop
 and print the averages.
 

@@ -52,13 +52,14 @@ BITMAPINFO bmi;
 HBITMAP hBitmap;
 HANDLE highResolutionTimer;
 
-constexpr int queuedPiecesToLookAhead=1;
+constexpr int queuedPiecesToLookAhead=0;
 constexpr DWORD inputDelayMs=0;
 constexpr DWORD screenUpdateDelayMs=1;
 constexpr DWORD screenUpdateTimeoutMs=250;
 constexpr DWORD boardResyncWarmupMs=1000;
-constexpr int boardResyncIntervalMoves=100;
+constexpr int boardResyncIntervalMoves=200;
 constexpr DWORD inputPollingDelayMs=3;
+constexpr int statusPrintIntervalMoves=200;
 constexpr int parallelSearchDepthThreshold=3;
 // Zero selects the machine's logical CPU count. The offline evaluator sets
 // this to one because it already parallelizes independent games.
@@ -2054,25 +2055,30 @@ int runBot(int argc,char* argv[]) {
             std::chrono::steady_clock::now()-cycleStart
         ).count();
         benchmarkStats.fullCycle.add(cycleMs);
-        cout<<fixed<<setprecision(3);
-        cout<<"move: "<<moveNumber<<"  piece: "<<playedPiece
-            <<"  position: "<<best_play[0]<<"  rotation: "<<best_play[1]
-            <<"  score: "<<best_play[2]
-            <<"  keys: "<<keyPressCount<<'\n';
-        cout<<"prepare: "<<preparationMs<<" ms"
-            <<"  search: "<<searchMs<<" ms"
-            <<"  placing: "<<placingMs<<" ms"
-            <<"  looking: "<<lookingMs<<" ms\n";
-        cout<<"  input: "<<placementInputMs<<" ms"
-            <<"  render wait: "<<renderWaitMs<<" ms"
-            <<"  capture: "<<captureMs<<" ms"
-            <<"  board update: "<<gridReadMs<<" ms"
-            <<"  queue: "<<queueReadMs<<" ms"
-            <<"  capture attempts: "<<updatedFrame.captureAttempts
-            <<"  queue synchronized: yes"
-            <<"  board resynced: "<<(boardResynchronized?"yes":"no")<<"\n";
-        cout<<"full cycle: "<<cycleMs<<" ms"
-            <<" ("<<(1000.0/cycleMs)<<" pieces/s)"<<endl;
+        bool printMoveStatus=debugMode || moveNumber==1
+            || moveNumber%statusPrintIntervalMoves==0;
+        if(printMoveStatus)
+        {
+            cout<<fixed<<setprecision(3);
+            cout<<"move: "<<moveNumber<<"  piece: "<<playedPiece
+                <<"  position: "<<best_play[0]<<"  rotation: "<<best_play[1]
+                <<"  score: "<<best_play[2]
+                <<"  keys: "<<keyPressCount<<'\n';
+            cout<<"prepare: "<<preparationMs<<" ms"
+                <<"  search: "<<searchMs<<" ms"
+                <<"  placing: "<<placingMs<<" ms"
+                <<"  looking: "<<lookingMs<<" ms\n";
+            cout<<"  input: "<<placementInputMs<<" ms"
+                <<"  render wait: "<<renderWaitMs<<" ms"
+                <<"  capture: "<<captureMs<<" ms"
+                <<"  board update: "<<gridReadMs<<" ms"
+                <<"  queue: "<<queueReadMs<<" ms"
+                <<"  capture attempts: "<<updatedFrame.captureAttempts
+                <<"  queue synchronized: yes"
+                <<"  board resynced: "<<(boardResynchronized?"yes":"no")<<"\n";
+            cout<<"full cycle: "<<cycleMs<<" ms"
+                <<" ("<<(1000.0/cycleMs)<<" pieces/s)"<<endl;
+        }
     }
     benchmarkStats.printSummary("stopped by user");
     cleanupCapture();

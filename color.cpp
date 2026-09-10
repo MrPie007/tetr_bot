@@ -52,19 +52,30 @@ BITMAPINFO bmi;
 HBITMAP hBitmap;
 HANDLE highResolutionTimer;
 
-constexpr int queuedPiecesToLookAhead=2;
+constexpr int queuedPiecesToLookAhead=1;
 constexpr DWORD inputDelayMs=0;
 constexpr DWORD screenUpdateDelayMs=1;
 constexpr DWORD screenUpdateTimeoutMs=250;
-constexpr DWORD inputPollingDelayMs=4;
+constexpr DWORD boardResyncWarmupMs=1000;
+constexpr int boardResyncIntervalMoves=100;
+constexpr DWORD inputPollingDelayMs=3;
+constexpr int parallelSearchDepthThreshold=3;
+// Zero selects the machine's logical CPU count. The offline evaluator sets
+// this to one because it already parallelizes independent games.
+int compactSearchThreadCount=0;
 int maxDepth=queuedPiecesToLookAhead;
 int realMaxDepth=queuedPiecesToLookAhead;
 constexpr int boardColumns=10;
 constexpr int boardRows=20;
 constexpr int queueLength=5;
+// Normal play only needs the searched pieces plus one known overlapping slot
+// to acknowledge that NEXT advanced by exactly one piece. Inspection and the
+// opening capture still read the complete five-piece queue.
+int trackedQueueSlots=queueLength;
 constexpr int cellSampleRadius=1;
 constexpr int queuePixelStride=2;
 constexpr int queueSlotVerticalMarginDivisor=6;
+constexpr double maximumQueueColorDistance=0.03;
 ScreenLayout screenLayout;
 int x=0;
 int y=0;
@@ -116,8 +127,10 @@ struct BenchmarkStats {
     TimingSeries lookingTotal;
     TimingSeries placingTotal;
     TimingSeries fullCycle;
-    array<size_t,7> placementChecks{};
-    array<size_t,7> placementMismatches{};
+    size_t queueSynchronizationCount=0;
+    size_t boardResyncCount=0;
+    size_t boardDriftCorrectionCount=0;
+    size_t correctedBoardCells=0;
     string activeStage;
     chrono::steady_clock::time_point activeStageStart;
 
@@ -140,12 +153,6 @@ struct BenchmarkStats {
         return chrono::duration<double,milli>(
             chrono::steady_clock::now()-activeStageStart
         ).count();
-    }
-
-    void recordPlacementCheck(int pieceIndex,bool mismatch) {
-        if(pieceIndex<0 || pieceIndex>=static_cast<int>(placementChecks.size())) return;
-        placementChecks[pieceIndex]++;
-        placementMismatches[pieceIndex]+=mismatch;
     }
 
     static void printSeries(const string& name,const TimingSeries& series) {
@@ -195,7 +202,7 @@ struct BenchmarkStats {
         output<<csvEscape(timestamp.str())<<','
               <<csvEscape(reason)<<','
               <<fullCycle.samples.size()<<','
-              <<queuedPiecesToLookAhead<<','
+              <<realMaxDepth<<','
               <<inputDelayMs<<','
               <<screenUpdateDelayMs<<','
               <<csvEscape(activeStage)<<','
@@ -235,7 +242,7 @@ struct BenchmarkStats {
         printSeries("Placement input",placementInput);
         printSeries("Render wait",renderWait);
         printSeries("Screen capture",screenCapture);
-        printSeries("Grid read",gridRead);
+        printSeries("Board update",gridRead);
         printSeries("Queue read",queueRead);
         printSeries("Looking total",lookingTotal);
         printSeries("Placing total",placingTotal);
@@ -243,14 +250,11 @@ struct BenchmarkStats {
         if(fullCycle.average()>0.0) {
             cout<<"Average throughput: "<<(1000.0/fullCycle.average())<<" pieces/s\n";
         }
-        static constexpr array<char,7> pieceNames{'I','J','L','O','Z','S','T'};
-        cout<<"Placement mismatches by piece:\n";
-        for(size_t index=0;index<pieceNames.size();index++) {
-            double rate=placementChecks[index]==0?0.0:
-                100.0*placementMismatches[index]/placementChecks[index];
-            cout<<"  "<<pieceNames[index]<<": "<<placementMismatches[index]
-                <<'/'<<placementChecks[index]<<" ("<<rate<<"%)\n";
-        }
+        cout<<"Physical NEXT synchronizations: "
+            <<queueSynchronizationCount<<'\n';
+        cout<<"Physical board resyncs: "<<boardResyncCount<<'\n';
+        cout<<"Board drift corrections: "<<boardDriftCorrectionCount
+            <<" ("<<correctedBoardCells<<" differing cells)\n";
         cout<<"===================================================\n";
         appendCsv(reason);
     }
@@ -350,6 +354,33 @@ void capture()
     BitBlt(hMemoryDC, 0, 0, width, height, hScreenDC, x, y, SRCCOPY);
     // Pixel buffer is ready in pPixels (BGRA format)
     pixels = (unsigned int*)pPixels;
+}
+void captureRegion(const ScreenRect& region)
+{
+    BitBlt(
+        hMemoryDC,
+        region.left-x,
+        region.top-y,
+        region.width(),
+        region.height(),
+        hScreenDC,
+        region.left,
+        region.top,
+        SRCCOPY
+    );
+    pixels=static_cast<unsigned int*>(pPixels);
+}
+void captureQueue(int slotCount=queueLength)
+{
+    slotCount=clamp(slotCount,1,queueLength);
+    ScreenRect capturedQueue=screenLayout.nextQueue;
+    capturedQueue.bottom=capturedQueue.top
+        +(screenLayout.nextQueue.height()*slotCount)/queueLength;
+    captureRegion(capturedQueue);
+}
+void captureBoard()
+{
+    captureRegion(screenLayout.board);
 }
 void configureCaptureRegion()
 {
@@ -512,14 +543,16 @@ color getRepresentativePieceColor(int tx,int ty,int bx,int by)
     }
     return bestColor;
 }
-vector<color>getQueueColors()
+vector<color>getQueueColors(int slotCount=queueLength)
 {
+    slotCount=clamp(slotCount,1,queueLength);
     vector<color>ret;
+    ret.reserve(slotCount);
     int tx=screenLayout.nextQueue.left-x;
     int bx=screenLayout.nextQueue.right-x-1;
     int queueTop=screenLayout.nextQueue.top-y;
     int queueHeight=screenLayout.nextQueue.height();
-    for(int i=0;i<queueLength;i++)
+    for(int i=0;i<slotCount;i++)
     {
         int ty=queueTop+(queueHeight*i)/queueLength;
         int by=queueTop+(queueHeight*(i+1))/queueLength-1;
@@ -544,10 +577,14 @@ Piece getPieceByColor(color c)
     }
     return all_p[mxi];
 }
-vector<Piece>getQueue(vector<color>* sampledColors=nullptr)
+vector<Piece>getQueue(
+    vector<color>* sampledColors=nullptr,
+    int slotCount=queueLength
+)
 {
     vector<Piece>ret;
-    vector<color>colors=getQueueColors();
+    vector<color>colors=getQueueColors(slotCount);
+    ret.reserve(colors.size());
     if(sampledColors)
     {
         *sampledColors=colors;
@@ -559,6 +596,33 @@ vector<Piece>getQueue(vector<color>* sampledColors=nullptr)
     return ret;
 
 }
+bool isReliableQueueReading(
+    const vector<Piece>& queue,
+    const vector<color>& sampledColors
+)
+{
+    if(queue.empty() || queue.size()>queueLength
+        || queue.size()!=sampledColors.size())
+    {
+        return false;
+    }
+    array<int,7>pieceCounts{};
+    for(size_t index=0;index<sampledColors.size();index++)
+    {
+        const color& sampled=sampledColors[index];
+        int highest=max({sampled.R,sampled.G,sampled.B});
+        int lowest=min({sampled.R,sampled.G,sampled.B});
+        if(highest<50 || highest-lowest<20
+            || getNearestPieceColorDistance(sampled)>maximumQueueColorDistance)
+        {
+            return false;
+        }
+        pieceCounts[queue[index].ind]++;
+    }
+    // Any five consecutive pieces from two seven-bags can contain a piece at
+    // most twice. This rejects transition artifacts such as JJJJJ.
+    return *max_element(pieceCounts.begin(),pieceCounts.end())<=2;
+}
 string getQueueTypes(const vector<Piece>& queue)
 {
     string types;
@@ -568,18 +632,21 @@ string getQueueTypes(const vector<Piece>& queue)
     }
     return types;
 }
-bool hasQueueAdvanced(const vector<Piece>& previous,const vector<Piece>& current)
+bool queueStartsWith(const vector<Piece>& queue,const vector<Piece>& prefix)
 {
-    if(previous.size()!=queueLength || current.size()!=queueLength)
+    if(prefix.size()>queue.size()) return false;
+    for(size_t index=0;index<prefix.size();index++)
     {
-        return false;
+        if(queue[index].type!=prefix[index].type) return false;
     }
-    for(int i=0;i+1<queueLength;i++)
+    return true;
+}
+bool queuesHaveSameTypes(const vector<Piece>& first,const vector<Piece>& second)
+{
+    if(first.size()!=second.size()) return false;
+    for(size_t index=0;index<first.size();index++)
     {
-        if(current[i].type!=previous[i+1].type)
-        {
-            return false;
-        }
+        if(first[index].type!=second[index].type) return false;
     }
     return true;
 }
@@ -591,11 +658,16 @@ struct UpdatedFrame {
     double queueReadMs=0;
     int captureAttempts=0;
 };
-UpdatedFrame waitForUpdatedFrame(const vector<Piece>& previousQueue)
+UpdatedFrame waitForQueueRefresh(
+    const vector<Piece>& expectedPrefix,
+    const vector<Piece>& previousCapturedQueue,
+    int slotCount
+)
 {
     UpdatedFrame result;
+    bool lastReadingReliable=false;
     auto synchronizationStart=chrono::steady_clock::now();
-    benchmarkStats.activeStage="render synchronization";
+    benchmarkStats.activeStage="queue refresh synchronization";
     benchmarkStats.activeStageStart=synchronizationStart;
 
     while(true)
@@ -607,19 +679,27 @@ UpdatedFrame waitForUpdatedFrame(const vector<Piece>& previousQueue)
         ).count();
 
         auto captureStart=chrono::steady_clock::now();
-        capture();
+        captureQueue(slotCount);
         result.captureMs+=chrono::duration<double,milli>(
             chrono::steady_clock::now()-captureStart
         ).count();
         result.captureAttempts++;
 
         auto queueStart=chrono::steady_clock::now();
-        result.queue=getQueue(&result.queueColors);
+        result.queue=getQueue(&result.queueColors,slotCount);
         result.queueReadMs+=chrono::duration<double,milli>(
             chrono::steady_clock::now()-queueStart
         ).count();
 
-        if(hasQueueAdvanced(previousQueue,result.queue))
+        lastReadingReliable=isReliableQueueReading(
+            result.queue,result.queueColors
+        );
+        // Compare only the slots captured in this poll. The opening reference
+        // contains all five slots, while normal polls intentionally read less.
+        bool changed=!queueStartsWith(previousCapturedQueue,result.queue);
+        if(lastReadingReliable
+            && changed
+            && queueStartsWith(result.queue,expectedPrefix))
         {
             benchmarkStats.activeStage.clear();
             return result;
@@ -631,9 +711,11 @@ UpdatedFrame waitForUpdatedFrame(const vector<Piece>& previousQueue)
         if(elapsed>=screenUpdateTimeoutMs)
         {
             ostringstream error;
-            error<<"Timed out waiting for NEXT queue to advance after "
-                 <<elapsed<<" ms; previous="<<getQueueTypes(previousQueue)
-                 <<", last seen="<<getQueueTypes(result.queue);
+            error<<"Timed out refreshing NEXT queue after "<<elapsed
+                 <<" ms; expected prefix="<<getQueueTypes(expectedPrefix)
+                 <<", previous capture="<<getQueueTypes(previousCapturedQueue)
+                 <<", last seen="<<getQueueTypes(result.queue)
+                 <<", reliable="<<(lastReadingReliable?"yes":"no");
             throw runtime_error(error.str());
         }
     }
@@ -683,82 +765,12 @@ bool SaveBMP(const char* filename, void* pPixels, int width, int height) {
 //for clarityp
 //Pieces are defined by center piece, and positions of other pieces relative to it
 vector<int>firstInCol(10,0);
-bool debugScore=0;
-bool startupOverlayMaskedLastGrid=false;
-bool startupOverlayDetectionEnabled=true;
-int startupOverlayLeft=0;
-int startupOverlayTop=0;
-int startupOverlayRight=0;
-int startupOverlayBottom=0;
-bool isStartupOverlayColor(color sampledColor)
-{
-    // Keep recognizing the yellow letters throughout their fade-out. Once
-    // red drops to the normal occupancy threshold, the pixels are harmless.
-    return sampledColor.R>34
-        && sampledColor.G>=24
-        && sampledColor.B<=100
-        && sampledColor.R-sampledColor.B>=25
-        && sampledColor.G-sampledColor.B>=18;
-}
-bool isStartupOverlayVisible()
-{
-    const int boardLeft=screenLayout.board.left-x;
-    const int boardTop=screenLayout.board.top-y;
-    const int boardWidth=screenLayout.board.width();
-    const int boardHeight=screenLayout.board.height();
-    const int scanLeft=boardLeft+boardWidth/10;
-    const int scanRight=boardLeft+(boardWidth*9)/10;
-    const int scanTop=boardTop+(boardHeight*3)/10;
-    const int scanBottom=boardTop+(boardHeight*7)/10;
-    int coloredSamples=0;
-    int leftmost=scanRight;
-    int rightmost=scanLeft;
-    int topmost=scanBottom;
-    int bottommost=scanTop;
-
-    // GO! is much wider than an O tetromino. Requiring both enough yellow
-    // pixels and a wide horizontal span avoids confusing a real piece with
-    // the startup overlay.
-    for(int py=scanTop;py<=scanBottom;py+=4)
-    {
-        for(int px=scanLeft;px<=scanRight;px+=4)
-        {
-            if(!isStartupOverlayColor(getPixelRel(px,py)))
-            {
-                continue;
-            }
-            coloredSamples++;
-            leftmost=min(leftmost,px);
-            rightmost=max(rightmost,px);
-            topmost=min(topmost,py);
-            bottommost=max(bottommost,py);
-        }
-    }
-    bool detected=coloredSamples>=8 && rightmost-leftmost>=boardWidth*2/5;
-    if(detected)
-    {
-        int padding=max(4,boardWidth/100);
-        startupOverlayLeft=leftmost-padding;
-        startupOverlayTop=topmost-padding;
-        startupOverlayRight=rightmost+padding;
-        startupOverlayBottom=bottommost+padding;
-    }
-    return detected;
-}
 void load_grid()
 {
     const double cellWidth=static_cast<double>(screenLayout.board.width())/boardColumns;
     const double cellHeight=static_cast<double>(screenLayout.board.height())/boardRows;
     const int boardLeft=screenLayout.board.left-x;
     const int boardTop=screenLayout.board.top-y;
-    startupOverlayMaskedLastGrid=startupOverlayDetectionEnabled
-        && isStartupOverlayVisible();
-    if(startupOverlayDetectionEnabled && !startupOverlayMaskedLastGrid)
-    {
-        // The startup overlay never returns. Stop looking for it so a later
-        // group of yellow blocks cannot be mistaken for GO!.
-        startupOverlayDetectionEnabled=false;
-    }
     for(int row=0;row<boardRows;row++)
     {
         for(int column=0;column<boardColumns;column++)
@@ -771,12 +783,7 @@ void load_grid()
                 centerX+cellSampleRadius,
                 centerY+cellSampleRadius
             );
-            bool startupOverlayCell=startupOverlayMaskedLastGrid
-                && centerX>=startupOverlayLeft
-                && centerX<=startupOverlayRight
-                && centerY>=startupOverlayTop
-                && centerY<=startupOverlayBottom;
-            if(!startupOverlayCell && (cur.R>34 || cur.G>34 || cur.B>34))
+            if(cur.R>34 || cur.G>34 || cur.B>34)
             {
                 grid[row][column] = 1;
             }
@@ -786,6 +793,21 @@ void load_grid()
             }
         }
     }
+}
+int countBoardDifferences(
+    const vector<vector<int>>& expected,
+    int firstComparedRow=4
+)
+{
+    int differences=0;
+    for(int row=firstComparedRow;row<boardRows;row++)
+    {
+        for(int column=0;column<boardColumns;column++)
+        {
+            differences+=expected[row][column]!=grid[row][column];
+        }
+    }
+    return differences;
 }
 void popPiece(int i,int j,int rot, Piece p)
 {
@@ -873,78 +895,17 @@ filesystem::path saveDebugCapture()
     }
     return path;
 }
-string serializeBoard(const vector<vector<int>>& board)
-{
-    string result;
-    result.reserve(boardRows*(boardColumns+1));
-    for(int row=0;row<boardRows;row++)
-    {
-        if(row>0) result.push_back('/');
-        for(int column=0;column<boardColumns;column++)
-        {
-            result.push_back(board[row][column]?'#':'.');
-        }
-    }
-    return result;
-}
-void appendPlacementMismatchReport(
-    int moveNumber,
-    char pieceType,
-    int position,
-    int rotation,
-    int differences,
-    const string& queueTypes,
-    const vector<vector<int>>& expected
-)
-{
-    filesystem::path path=executableDirectory()/"placement_mismatches.csv";
-    error_code fileError;
-    bool needsHeader=!filesystem::exists(path,fileError)
-        || filesystem::file_size(path,fileError)==0;
-    ofstream output(path,ios::app);
-    if(!output)
-    {
-        cerr<<"Could not append placement mismatch report: "<<path.string()<<'\n';
-        return;
-    }
-    if(needsHeader)
-    {
-        output<<"move,piece,position,rotation,differences,queue,expected_board,captured_board\n";
-    }
-    output<<moveNumber<<','<<pieceType<<','<<position<<','<<rotation<<','
-          <<differences<<','<<queueTypes<<','<<serializeBoard(expected)<<','
-          <<serializeBoard(grid)<<'\n';
-}
-filesystem::path savePlacementMismatchCapture(
-    int moveNumber,
-    char pieceType,
-    int position,
-    int rotation,
-    int differences
-)
-{
-    ostringstream filename;
-    filename<<"placement_mismatch_move_"<<moveNumber
-            <<'_'<<pieceType
-            <<"_x"<<position
-            <<"_r"<<rotation
-            <<"_diff"<<differences<<".bmp";
-    filesystem::path path=executableDirectory()/filename.str();
-    if(!SaveBMP(path.string().c_str(),pPixels,width,height))
-    {
-        cerr<<"Could not save placement mismatch capture: "<<path.string()<<endl;
-        return {};
-    }
-    return path;
-}
 void printDebugSnapshot(
     const string& label,
     const vector<Piece>& queue,
     const vector<color>& queueColors,
-    optional<char> currentPieceType=nullopt
+    optional<char> currentPieceType=nullopt,
+    bool saveCapturedImage=true,
+    const string& boardSource="captured image"
 )
 {
-    const filesystem::path capturePath=saveDebugCapture();
+    filesystem::path capturePath;
+    if(saveCapturedImage) capturePath=saveDebugCapture();
     cout<<"\n=== DEBUG SNAPSHOT: "<<label<<" ===\n";
     if(!capturePath.empty())
     {
@@ -955,14 +916,13 @@ void printDebugSnapshot(
         <<") "<<screenLayout.board.width()<<" x "<<screenLayout.board.height()<<'\n';
     cout<<"NEXT rect:    ("<<screenLayout.nextQueue.left<<", "<<screenLayout.nextQueue.top
         <<") "<<screenLayout.nextQueue.width()<<" x "<<screenLayout.nextQueue.height()<<'\n';
-    cout<<"Startup overlay mask: "
-        <<(startupOverlayMaskedLastGrid?"applied":"not needed")<<'\n';
+    cout<<"Board source: "<<boardSource<<'\n';
     if(currentPieceType)
     {
         cout<<"Tracked current piece: "<<*currentPieceType<<'\n';
     }
 
-    cout<<"\nDetected board (# = filled, . = empty)\n";
+    cout<<"\nBoard state (# = filled, . = empty)\n";
     cout<<"    0123456789\n";
     for(int row=0;row<boardRows;row++)
     {
@@ -1115,11 +1075,10 @@ BoardFeatures analyzeGrid()
     return features;
 }
 
-int getScoreOfGrid()
+int getScoreFromFeatures(const BoardFeatures& features)
 {
-    BoardFeatures features=analyzeGrid();
     int dangerHeight=max(0,features.maximumHeight-12);
-    int score=
+    return
         features.aggregateHeight*40
         +features.maximumHeight*75
         +features.bumpiness*25
@@ -1130,20 +1089,12 @@ int getScoreOfGrid()
         +features.rowTransitions*10
         +features.columnTransitions*10
         +dangerHeight*dangerHeight*100;
+}
 
-    if(debugScore)
-    {
-        cout<<"aggregate height="<<features.aggregateHeight
-            <<" max height="<<features.maximumHeight
-            <<" holes="<<features.holes
-            <<" hole depth="<<features.holeDepth
-            <<" bumpiness="<<features.bumpiness
-            <<" wells="<<features.wells
-            <<" row transitions="<<features.rowTransitions
-            <<" column transitions="<<features.columnTransitions
-            <<" score="<<score<<'\n';
-    }
-    return score;
+int getScoreOfGrid()
+{
+    BoardFeatures features=analyzeGrid();
+    return getScoreFromFeatures(features);
 }
 
 int getLineClearReward(int clearedLines)
@@ -1227,19 +1178,6 @@ vector<vector<int>> predictBoardAfterPlacement(
     unsaveGrid();
     return predicted;
 }
-int countPlacementDifferences(const vector<vector<int>>& predicted)
-{
-    int differences=0;
-    // Ignore the spawn rows, where the newly active piece can be visible.
-    for(int row=4;row<boardRows;row++)
-    {
-        for(int column=0;column<boardColumns;column++)
-        {
-            differences+=predicted[row][column]!=grid[row][column];
-        }
-    }
-    return differences;
-}
 vector<pair<int,int>>getMoves(Piece &p)
 {
     vector<pair<int,int>>ret;
@@ -1257,6 +1195,315 @@ vector<pair<int,int>>getMoves(Piece &p)
     return ret;
 }
 vector<array<int,3>>retV;
+
+// Search uses a compact copy of the board. Each row is a 10-bit mask, so a
+// recursive branch can be copied without allocating or touching the live grid.
+struct CompactBoard {
+    array<uint16_t,boardRows> rows{};
+    array<uint8_t,boardColumns> heights{};
+};
+
+CompactBoard makeCompactBoard()
+{
+    CompactBoard board;
+    for(int row=0;row<boardRows;row++)
+    {
+        uint16_t mask=0;
+        for(int column=0;column<boardColumns;column++)
+        {
+            if(grid[row][column]) mask|=uint16_t{1}<<column;
+        }
+        board.rows[row]=mask;
+    }
+    for(int column=0;column<boardColumns;column++)
+    {
+        board.heights[column]=static_cast<uint8_t>(firstInCol[column]);
+    }
+    return board;
+}
+
+int getLowestRow(const CompactBoard& board,int position,int rotation,const Piece& piece)
+{
+    int landingRow=boardRows;
+    for(const auto& cell:piece.cells[rotation])
+    {
+        int column=position+cell.first;
+        if(column<0 || column>=boardColumns) return -1;
+        landingRow=min(
+            landingRow,
+            boardRows-1-static_cast<int>(board.heights[column])-cell.second
+        );
+    }
+    for(const auto& cell:piece.cells[rotation])
+    {
+        int row=landingRow+cell.second;
+        if(row<0 || row>=boardRows) return -1;
+    }
+    return landingRow;
+}
+
+void rebuildCompactHeights(CompactBoard& board)
+{
+    board.heights.fill(0);
+    for(int row=0;row<boardRows;row++)
+    {
+        uint16_t cells=board.rows[row];
+        if(cells==0) continue;
+        for(int column=0;column<boardColumns;column++)
+        {
+            if(board.heights[column]==0 && (cells&(uint16_t{1}<<column)))
+            {
+                board.heights[column]=static_cast<uint8_t>(boardRows-row);
+            }
+        }
+    }
+}
+
+int placeAndClear(
+    CompactBoard& board,
+    int landingRow,
+    int position,
+    int rotation,
+    const Piece& piece
+)
+{
+    for(const auto& cell:piece.cells[rotation])
+    {
+        int row=landingRow+cell.second;
+        int column=position+cell.first;
+        if(row<0 || row>=boardRows || column<0 || column>=boardColumns)
+        {
+            throw runtime_error("Invalid compact-board placement");
+        }
+        uint16_t cellMask=uint16_t{1}<<column;
+        if(board.rows[row]&cellMask)
+        {
+            throw runtime_error("Invalid compact-board placement");
+        }
+        board.rows[row]|=cellMask;
+        board.heights[column]=static_cast<uint8_t>(max(
+            static_cast<int>(board.heights[column]),boardRows-row
+        ));
+    }
+
+    constexpr uint16_t fullRowMask=(uint16_t{1}<<boardColumns)-1;
+    int destination=boardRows-1;
+    int clearedLines=0;
+    for(int source=boardRows-1;source>=0;source--)
+    {
+        if(board.rows[source]==fullRowMask)
+        {
+            clearedLines++;
+        }
+        else
+        {
+            board.rows[destination--]=board.rows[source];
+        }
+    }
+    while(destination>=0) board.rows[destination--]=0;
+    if(clearedLines>0) rebuildCompactHeights(board);
+    return clearedLines;
+}
+
+BoardFeatures analyzeGrid(const CompactBoard& board)
+{
+    BoardFeatures features;
+    for(int column=0;column<boardColumns;column++)
+    {
+        int height=board.heights[column];
+        features.aggregateHeight+=height;
+        features.maximumHeight=max(features.maximumHeight,height);
+
+        bool blockSeen=false;
+        int blocksAbove=0;
+        int previous=1;
+        for(int row=0;row<boardRows;row++)
+        {
+            int occupied=(board.rows[row]>>column)&1;
+            features.columnTransitions+=occupied!=previous;
+            previous=occupied;
+            if(occupied)
+            {
+                blockSeen=true;
+                blocksAbove++;
+            }
+            else if(blockSeen)
+            {
+                features.holes++;
+                features.holeDepth+=blocksAbove;
+            }
+        }
+        features.columnTransitions+=previous!=1;
+    }
+
+    for(int column=0;column+1<boardColumns;column++)
+    {
+        features.bumpiness+=abs(
+            static_cast<int>(board.heights[column])
+            -static_cast<int>(board.heights[column+1])
+        );
+    }
+
+    for(int row=0;row<boardRows;row++)
+    {
+        int previous=1;
+        for(int column=0;column<boardColumns;column++)
+        {
+            int occupied=(board.rows[row]>>column)&1;
+            features.rowTransitions+=occupied!=previous;
+            previous=occupied;
+        }
+        features.rowTransitions+=previous!=1;
+    }
+
+    array<int,boardColumns> wellDepth{};
+    for(int row=0;row<boardRows;row++)
+    {
+        for(int column=0;column<boardColumns;column++)
+        {
+            bool occupied=(board.rows[row]>>column)&1;
+            bool leftFilled=column==0 || ((board.rows[row]>>(column-1))&1);
+            bool rightFilled=column==boardColumns-1
+                || ((board.rows[row]>>(column+1))&1);
+            if(!occupied && leftFilled && rightFilled)
+            {
+                features.wells+=++wellDepth[column];
+            }
+            else
+            {
+                wellDepth[column]=0;
+            }
+        }
+    }
+    return features;
+}
+
+struct CompactSearchResult {
+    int position=4;
+    int rotation=0;
+    int score=10000000;
+};
+
+CompactSearchResult getBestPosCompact(
+    const CompactBoard& board,
+    const Piece& piece,
+    int depth
+)
+{
+    CompactSearchResult best;
+    for(int rotation=0;rotation<static_cast<int>(piece.cells.size());rotation++)
+    {
+        for(int position=-1;position<boardColumns;position++)
+        {
+            int landingRow=getLowestRow(board,position,rotation,piece);
+            if(landingRow<0) continue;
+
+            CompactBoard next=board;
+            int clearedLines=placeAndClear(
+                next,landingRow,position,rotation,piece
+            );
+            BoardFeatures features=analyzeGrid(next);
+            int futureScore=depth>=maxDepth
+                ?getScoreFromFeatures(features)
+                :getBestPosCompact(next,curQueue[depth],depth+1).score;
+            int score=futureScore
+                +features.holes*20000
+                +features.holeDepth*1000
+                -getLineClearReward(clearedLines);
+
+            if(depth==0) retV.push_back({position,rotation,score});
+            if(score<best.score)
+            {
+                best={position,rotation,score};
+            }
+        }
+    }
+    return best;
+}
+
+CompactSearchResult getBestPosCompactParallel(
+    const CompactBoard& board,
+    const Piece& piece
+)
+{
+    vector<CompactSearchResult> candidates;
+    for(int rotation=0;rotation<static_cast<int>(piece.cells.size());rotation++)
+    {
+        for(int position=-1;position<boardColumns;position++)
+        {
+            if(getLowestRow(board,position,rotation,piece)>=0)
+            {
+                candidates.push_back({position,rotation,10000000});
+            }
+        }
+    }
+    if(candidates.empty()) return {};
+
+    unsigned int available=thread::hardware_concurrency();
+    int requested=compactSearchThreadCount>0
+        ?compactSearchThreadCount
+        :static_cast<int>(available==0?1:available);
+    int workerCount=max(1,min(static_cast<int>(candidates.size()),requested));
+    if(workerCount==1)
+    {
+        return getBestPosCompact(board,piece,0);
+    }
+
+    atomic<size_t> nextCandidate{0};
+    atomic<bool> cancelWorkers{false};
+    mutex errorMutex;
+    exception_ptr workerError;
+    auto evaluateCandidate=[&]() {
+        while(!cancelWorkers.load(memory_order_relaxed))
+        {
+            size_t index=nextCandidate.fetch_add(1,memory_order_relaxed);
+            if(index>=candidates.size()) return;
+            try
+            {
+                CompactSearchResult& candidate=candidates[index];
+                int landingRow=getLowestRow(
+                    board,candidate.position,candidate.rotation,piece
+                );
+                CompactBoard next=board;
+                int clearedLines=placeAndClear(
+                    next,landingRow,candidate.position,candidate.rotation,piece
+                );
+                BoardFeatures features=analyzeGrid(next);
+                int futureScore=maxDepth==0
+                    ?getScoreFromFeatures(features)
+                    :getBestPosCompact(next,curQueue[0],1).score;
+                candidate.score=futureScore
+                    +features.holes*20000
+                    +features.holeDepth*1000
+                    -getLineClearReward(clearedLines);
+            }
+            catch(...)
+            {
+                {
+                    lock_guard<mutex> errorLock(errorMutex);
+                    if(!workerError) workerError=current_exception();
+                }
+                cancelWorkers.store(true,memory_order_relaxed);
+                return;
+            }
+        }
+    };
+
+    vector<thread> workers;
+    workers.reserve(workerCount);
+    for(int index=0;index<workerCount;index++) workers.emplace_back(evaluateCandidate);
+    for(thread& worker:workers) worker.join();
+    if(workerError) rethrow_exception(workerError);
+
+    CompactSearchResult best;
+    for(const CompactSearchResult& candidate:candidates)
+    {
+        retV.push_back({candidate.position,candidate.rotation,candidate.score});
+        if(candidate.score<best.score) best=candidate;
+    }
+    return best;
+}
+
 array<int,3> getBestPos(Piece &p,int curDepth)
 {
     if(curDepth>maxDepth)
@@ -1310,7 +1557,11 @@ array<int,3> getBestPosIterative(Piece p)
 {
     maxDepth=realMaxDepth;
     retV.clear();
-    return getBestPos(p,0);
+    CompactBoard board=makeCompactBoard();
+    CompactSearchResult best=maxDepth>=parallelSearchDepthThreshold
+        ?getBestPosCompactParallel(board,p)
+        :getBestPosCompact(board,p,0);
+    return {best.position,best.rotation,best.score};
 }
 vector<pair<int,int>>movesForPiece[7];
 void preCompMoves()
@@ -1431,11 +1682,39 @@ int runBot(int argc,char* argv[]) {
             debugMode=true;
             inspectOnly=true;
         }
+        else if(argument=="--lookahead")
+        {
+            if(i+1>=argc)
+            {
+                cerr<<"--lookahead requires a value from 0 to "
+                    <<queueLength-1<<endl;
+                return 1;
+            }
+            string value=argv[++i];
+            size_t parsed=0;
+            try
+            {
+                realMaxDepth=stoi(value,&parsed);
+            }
+            catch(const exception&)
+            {
+                parsed=0;
+                realMaxDepth=-1;
+            }
+            if(parsed!=value.size() || realMaxDepth<0 || realMaxDepth>=queueLength)
+            {
+                cerr<<"--lookahead must be an integer from 0 to "
+                    <<queueLength-1<<endl;
+                return 1;
+            }
+        }
         else if(argument=="--help")
         {
-            cout<<"Usage: color.exe [--debug | --inspect]\n"
-                <<"  --debug    Run the bot and log every captured state.\n"
-                <<"  --inspect  Capture and log one state without playing.\n";
+            cout<<"Usage: color.exe [--debug | --inspect] [--lookahead N]\n"
+                <<"  --debug    Run the bot and log every tracked state.\n"
+                <<"  --inspect  Capture and log one state without playing.\n"
+                <<"  --lookahead N  Search 0 to "<<queueLength-1
+                <<" queued pieces (default: "<<queuedPiecesToLookAhead<<").\n";
             return 0;
         }
         else
@@ -1444,6 +1723,9 @@ int runBot(int argc,char* argv[]) {
             return 1;
         }
     }
+    trackedQueueSlots=min(queueLength,max(2,realMaxDepth+1));
+    cout<<"Solver lookahead: "<<realMaxDepth<<" queued piece(s)\n"
+        <<"Tracked NEXT slots per move: "<<trackedQueueSlots<<endl;
     string layoutError;
     const auto layoutPath=defaultScreenLayoutPath();
     if(!loadScreenLayout(layoutPath,screenLayout,layoutError))
@@ -1517,30 +1799,64 @@ int runBot(int argc,char* argv[]) {
         return -1;
     }
     cout<<(inspectOnly?"Inspection mode.":"Bot ready.")<<endl;
-    cout<<"Press P when the game is visible and ready."<<endl;
+    cout<<(inspectOnly
+        ?"Press P when the game is visible and ready."
+        :"Press P while the opening five-piece queue is visible, before the game starts.")
+        <<endl;
     while (true) {
         if (GetAsyncKeyState(0x50) & 0x8000) {
-            cout<<(inspectOnly?"Capturing inspection frame...":"Starting game...")<<endl;
+            cout<<(inspectOnly?"Capturing inspection frame...":"Capturing opening queue...")<<endl;
             cout.flush();
             break;
         }
         Sleep(inputPollingDelayMs);
     }
-    capture();
-    load_grid();
     vector<color>queueColors;
-    curQueue=getQueue(&queueColors);
     if(inspectOnly)
     {
+        capture();
+        load_grid();
+        curQueue=getQueue(&queueColors);
         printDebugSnapshot("initial capture",curQueue,queueColors);
         cleanupCapture();
         return 0;
     }
+    captureQueue(queueLength);
+    curQueue=getQueue(&queueColors,queueLength);
+    if(!isReliableQueueReading(curQueue,queueColors))
+    {
+        throw runtime_error(
+            "The opening queue capture is incomplete or has unreliable colors"
+        );
+    }
     if(debugMode)
     {
-        printDebugSnapshot("initial capture",curQueue,queueColors);
+        printDebugSnapshot(
+            "initial NEXT capture",
+            curQueue,
+            queueColors,
+            curQueue.front().type,
+            false,
+            "known empty board"
+        );
     }
-    //I need to put a piece first before bot taking over
+    Piece manuallyPlayedPiece=curQueue[0];
+    Piece firstBotPiece=curQueue[1];
+    vector<Piece>openingQueue=curQueue;
+    // Three slots make the one-time opening transition unambiguous even when
+    // the first two pieces happen to repeat across a seven-bag boundary.
+    int openingSynchronizationSlots=max(3,trackedQueueSlots);
+    size_t openingKnownSlots=min(
+        static_cast<size_t>(openingSynchronizationSlots),
+        openingQueue.size()-2
+    );
+    vector<Piece>expectedQueuePrefix(
+        openingQueue.begin()+2,
+        openingQueue.begin()+2+openingKnownSlots
+    );
+    cout<<"Opening queue: "<<getQueueTypes(openingQueue)<<'\n'
+        <<"Start the game, then hard-drop "<<manuallyPlayedPiece.type
+        <<" at its default position and orientation."<<endl;
     while (true) {
         if (GetAsyncKeyState(VK_SPACE) & 0x8000) {
             // Do not let the first injected hard drop overlap the user's
@@ -1550,15 +1866,31 @@ int runBot(int argc,char* argv[]) {
         }
         Sleep(inputPollingDelayMs);
     }
-    curPiece=curQueue[0];
-    UpdatedFrame firstUpdatedFrame=waitForUpdatedFrame(curQueue);
+    UpdatedFrame firstUpdatedFrame=waitForQueueRefresh(
+        expectedQueuePrefix,
+        openingQueue,
+        openingSynchronizationSlots
+    );
+    vector<vector<int>>openingBoard=predictBoardAfterPlacement(
+        manuallyPlayedPiece,4,0
+    );
+    grid=openingBoard;
+    clear_all_grid();
+    curPiece=firstBotPiece;
     curQueue=move(firstUpdatedFrame.queue);
     queueColors=move(firstUpdatedFrame.queueColors);
-    load_grid();
     if(debugMode)
     {
-        printDebugSnapshot("after manual first placement",curQueue,queueColors,curPiece.type);
+        printDebugSnapshot(
+            "after known manual opening placement",
+            curQueue,
+            queueColors,
+            curPiece.type,
+            false,
+            "known empty board plus default opening hard drop"
+        );
     }
+    auto takeoverStart=chrono::steady_clock::now();
     /*
         Flow of logic should be something like
 
@@ -1567,7 +1899,6 @@ int runBot(int argc,char* argv[]) {
         3. get new statep
     */
     int cur_move=1;
-    int placementMismatchCount=0;
     while (1) 
     {   
         //if I press P stop the bot (fail safe instead of ctrl c from terminal)
@@ -1621,12 +1952,7 @@ int runBot(int argc,char* argv[]) {
         //cout<<endl;
         if(debugMode)
         {
-            benchmarkStats.beginStage("debug verification");
-            pushPiece(getLowestRow(best_play[0],best_play[1],curPiece),best_play[0],best_play[1],curPiece);
-            debugScore=1;
-            cout<<"score after chosen move: "<<getScoreOfGrid()<<endl;
-            debugScore=0;
-            benchmarkStats.activeStage.clear();
+            cout<<"score after chosen move: "<<best_play[2]<<endl;
         }
         
         
@@ -1639,58 +1965,74 @@ int runBot(int argc,char* argv[]) {
         size_t keyPressCount=actuallyPutThePiece(best_play[0],best_play[1]);
         double placementInputMs=benchmarkStats.finishStage(benchmarkStats.placementInput);
 
-        // Poll captured frames until NEXT has actually shifted. This replaces the
-        // fixed render sleep and leaves the final successful frame in pPixels.
-        UpdatedFrame updatedFrame=waitForUpdatedFrame(curQueue);
+        auto boardUpdateStart=chrono::steady_clock::now();
+        grid=move(predictedBoard);
+        clear_all_grid();
+        double gridReadMs=chrono::duration<double,milli>(
+            chrono::steady_clock::now()-boardUpdateStart
+        ).count();
+
+        if(curQueue.empty())
+        {
+            throw runtime_error("The local NEXT queue ran out of pieces");
+        }
+        Piece nextActivePiece=curQueue.front();
+        vector<Piece>previousQueue=curQueue;
+        vector<Piece>expectedAdvancedPrefix(
+            previousQueue.begin()+1,previousQueue.end()
+        );
+        UpdatedFrame updatedFrame=waitForQueueRefresh(
+            expectedAdvancedPrefix,
+            previousQueue,
+            trackedQueueSlots
+        );
+        curPiece=nextActivePiece;
+        curQueue=move(updatedFrame.queue);
+        queueColors=move(updatedFrame.queueColors);
+        bool boardResynchronized=false;
+        benchmarkStats.queueSynchronizationCount++;
+
+        auto timeSinceTakeover=chrono::duration_cast<chrono::milliseconds>(
+            chrono::steady_clock::now()-takeoverStart
+        ).count();
+        if(timeSinceTakeover>=boardResyncWarmupMs
+            && moveNumber%boardResyncIntervalMoves==0)
+        {
+            vector<vector<int>>simulatedBoard=grid;
+            auto boardCaptureStart=chrono::steady_clock::now();
+            captureBoard();
+            updatedFrame.captureMs+=chrono::duration<double,milli>(
+                chrono::steady_clock::now()-boardCaptureStart
+            ).count();
+
+            benchmarkStats.activeStage="board resynchronization";
+            benchmarkStats.activeStageStart=chrono::steady_clock::now();
+            load_grid();
+            // The active piece may be visible in the spawn rows. Those cells
+            // are not part of the locked board.
+            for(int row=0;row<4;row++) grid[row]=simulatedBoard[row];
+            clear_all_grid();
+            gridReadMs+=benchmarkStats.activeStageElapsed();
+            benchmarkStats.activeStage.clear();
+
+            int boardDifferences=countBoardDifferences(simulatedBoard);
+            benchmarkStats.boardResyncCount++;
+            boardResynchronized=true;
+            if(boardDifferences>0)
+            {
+                benchmarkStats.boardDriftCorrectionCount++;
+                benchmarkStats.correctedBoardCells+=boardDifferences;
+                cerr<<"Board state corrected on move "<<moveNumber
+                    <<" ("<<boardDifferences<<" differing cells).\n";
+            }
+        }
         double renderWaitMs=updatedFrame.renderWaitMs;
         double captureMs=updatedFrame.captureMs;
         double queueReadMs=updatedFrame.queueReadMs;
         benchmarkStats.renderWait.add(renderWaitMs);
         benchmarkStats.screenCapture.add(captureMs);
+        benchmarkStats.gridRead.add(gridReadMs);
         benchmarkStats.queueRead.add(queueReadMs);
-
-        benchmarkStats.beginStage("grid read");
-        load_grid();
-        double gridReadMs=benchmarkStats.finishStage(benchmarkStats.gridRead);
-        int placementDifferences=countPlacementDifferences(predictedBoard);
-        benchmarkStats.recordPlacementCheck(curPiece.ind,placementDifferences>0);
-        if(placementDifferences>0)
-        {
-            placementMismatchCount++;
-            appendPlacementMismatchReport(
-                moveNumber,
-                playedPiece,
-                best_play[0],
-                best_play[1],
-                placementDifferences,
-                getQueueTypes(curQueue),
-                predictedBoard
-            );
-            cerr<<"Placement mismatch on move "<<moveNumber
-                <<": planned piece "<<playedPiece
-                <<" at position "<<best_play[0]
-                <<", rotation "<<best_play[1]
-                <<", but "<<placementDifferences
-                <<" captured board cells differ";
-            if(placementMismatchCount<=5)
-            {
-                filesystem::path mismatchCapture=savePlacementMismatchCapture(
-                    moveNumber,
-                    playedPiece,
-                    best_play[0],
-                    best_play[1],
-                    placementDifferences
-                );
-                if(!mismatchCapture.empty())
-                {
-                    cerr<<"; capture="<<mismatchCapture.string();
-                }
-            }
-            cerr<<'\n';
-        }
-        curPiece=curQueue[0];
-        curQueue=move(updatedFrame.queue);
-        queueColors=move(updatedFrame.queueColors);
         double lookingMs=captureMs+gridReadMs+queueReadMs;
         double placingMs=placementInputMs+renderWaitMs;
         benchmarkStats.lookingTotal.add(lookingMs);
@@ -1701,7 +2043,11 @@ int runBot(int argc,char* argv[]) {
                 "after bot move "+to_string(cur_move-1),
                 curQueue,
                 queueColors,
-                curPiece.type
+                curPiece.type,
+                boardResynchronized,
+                boardResynchronized
+                    ?"periodic physical board resynchronization"
+                    :"trusted simulation since the last resynchronization"
             );
         }
         double cycleMs=std::chrono::duration<double,std::milli>(
@@ -1720,9 +2066,11 @@ int runBot(int argc,char* argv[]) {
         cout<<"  input: "<<placementInputMs<<" ms"
             <<"  render wait: "<<renderWaitMs<<" ms"
             <<"  capture: "<<captureMs<<" ms"
-            <<"  grid: "<<gridReadMs<<" ms"
+            <<"  board update: "<<gridReadMs<<" ms"
             <<"  queue: "<<queueReadMs<<" ms"
-            <<"  capture attempts: "<<updatedFrame.captureAttempts<<"\n";
+            <<"  capture attempts: "<<updatedFrame.captureAttempts
+            <<"  queue synchronized: yes"
+            <<"  board resynced: "<<(boardResynchronized?"yes":"no")<<"\n";
         cout<<"full cycle: "<<cycleMs<<" ms"
             <<" ("<<(1000.0/cycleMs)<<" pieces/s)"<<endl;
     }

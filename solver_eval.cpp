@@ -6,6 +6,7 @@ struct EvaluationOptions {
     int maxPieces=2000;
     int lookahead=queuedPiecesToLookAhead;
     int threads=0;
+    int searchThreads=1;
     uint32_t seed=2;
     string label="default";
     filesystem::path csvPath=executableDirectory()/"solver_eval_results.csv";
@@ -79,6 +80,7 @@ void printEvaluationUsage()
         <<"  --lookahead N     Queued pieces searched, from 0 to 4 (default: "
         <<queuedPiecesToLookAhead<<")\n"
         <<"  --threads N       Parallel game workers; 0 selects automatically (default: 0)\n"
+        <<"  --search-threads N  Threads per move at depth 3+; 0 selects automatically (default: 1)\n"
         <<"  --seed N          Base seven-bag seed (default: 2)\n"
         <<"  --label TEXT      Version label stored in the CSV summary\n"
         <<"  --csv PATH        Summary CSV path\n"
@@ -146,6 +148,15 @@ EvaluationOptions parseEvaluationOptions(int argc,char* argv[])
             }
             options.threads=static_cast<int>(threads);
         }
+        else if(argument=="--search-threads")
+        {
+            uint64_t threads=parseUnsignedArgument(requireValue(),argument);
+            if(threads>static_cast<uint64_t>(numeric_limits<int>::max()))
+            {
+                throw invalid_argument("--search-threads is too large");
+            }
+            options.searchThreads=static_cast<int>(threads);
+        }
         else if(argument=="--seed")
         {
             uint64_t seed=parseUnsignedArgument(requireValue(),argument);
@@ -212,6 +223,7 @@ void resetSolverState()
 GameResult evaluateGame(const EvaluationOptions& options,uint32_t gameSeed)
 {
     resetSolverState();
+    compactSearchThreadCount=options.searchThreads;
     realMaxDepth=options.lookahead;
     maxDepth=options.lookahead;
 
@@ -354,6 +366,7 @@ GameResult evaluateGameInChildProcess(
     command<<quoteWindowsArgument(executable.wstring())
            <<L" --max-pieces "<<options.maxPieces
            <<L" --lookahead "<<options.lookahead
+           <<L" --search-threads "<<options.searchThreads
            <<L" --seed "<<gameSeed
            <<L" --worker-result "<<quoteWindowsArgument(resultPath.wstring());
     wstring commandLine=command.str();
@@ -467,7 +480,7 @@ void appendEvaluationCsv(
             <<"max_survival,shortest_game_seed,total_lines,lines_per_piece,"
             <<"hole_creating_rate,avg_holes,max_holes,max_height,avg_search_ms,"
             <<"p95_search_ms,max_search_ms,solver_pps,wall_time_ms,threads,"
-            <<"parallel_pps\n";
+            <<"parallel_pps,search_threads\n";
     }
     output<<BenchmarkStats::csvEscape(evaluationTimestamp())<<','
           <<BenchmarkStats::csvEscape(options.label)<<','
@@ -482,7 +495,8 @@ void appendEvaluationCsv(
           <<searchTimes.percentile(0.95)<<','<<searchTimes.maximum()<<','
           <<(searchTimes.total()>0?1000.0*totalPieces/searchTimes.total():0.0)<<','
           <<wallTimeMs<<','<<workerCount<<','
-          <<(wallTimeMs>0?1000.0*totalPieces/wallTimeMs:0.0)<<'\n';
+          <<(wallTimeMs>0?1000.0*totalPieces/wallTimeMs:0.0)<<','
+          <<options.searchThreads<<'\n';
 }
 
 void printEvaluationSummary(
@@ -526,6 +540,9 @@ void printEvaluationSummary(
     cout<<"Label: "<<options.label<<'\n';
     cout<<"Base seed: "<<options.seed<<'\n';
     cout<<"Parallel workers: "<<workerCount<<'\n';
+    cout<<"Per-move search threads: "
+        <<(options.searchThreads==0?"automatic":to_string(options.searchThreads))
+        <<'\n';
     cout<<"Games: "<<games.size()<<" ("<<topOuts<<" top-outs, "
         <<games.size()-topOuts<<" reached the piece cap)\n";
     cout<<"Lookahead: "<<options.lookahead<<" queued piece(s)\n";

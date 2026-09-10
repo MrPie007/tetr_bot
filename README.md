@@ -23,8 +23,8 @@ then follow the console prompts to select:
    its white header and border.
 
 The tool writes `screen_layout.cfg` next to the executable. The bot reads this
-file at startup, captures the smallest rectangle containing both selected
-regions, and derives every board cell center from the selected board size.
+file at startup, allocates a pixel buffer covering both selected regions, and
+derives every board cell center from the selected board size.
 
 Because occupancy is sampled from a 3 x 3 area at each cell's center, outlined
 ghost cells continue to be treated as empty.
@@ -44,20 +44,20 @@ Queue colors are matched by chromaticity rather than raw brightness, so the
 same piece is recognized consistently across the preview's highlights,
 shadows, and locked-block shading.
 
-To run the bot while saving and printing every captured state, use:
+To run the bot while printing every tracked state, use:
 
 ```powershell
 .\color.exe --debug
 ```
 
-Debug captures are written next to `color.exe` and are ignored by Git.
-
-At game startup, the board reader detects the wide yellow `GO!` overlay and
-ignores its yellow samples. You can press the first hard drop while `GO!` is
-still visible instead of waiting for it to disappear. Detection permanently
-turns off as soon as the overlay is absent, preventing yellow blocks later in
-the game from being mistaken for another startup overlay. If no `GO!` appears,
-the detector disables itself on the first capture and normal play is unchanged.
+For normal play, press `P` while the opening five-piece queue is visible, before
+the game starts. Its top piece is treated as the human-controlled opening piece.
+Start the game and hard-drop that piece at its default position and orientation.
+Because the board was empty, the bot constructs the resulting board directly,
+takes control with the second opening piece, and does not capture startup board
+graphics. Later states are simulated, while a periodic physical board audit can
+repair drift. Audits begin after a one-second warm-up and run every 25 moves;
+the bot keeps playing during the warm-up.
 
 ## Placement evaluation
 
@@ -95,26 +95,44 @@ of games, whichever is smaller. Use `--threads 1` for a serial baseline. The
 summary reports both per-worker solver throughput and actual parallel
 wall-clock throughput, and stores the worker count in the CSV.
 
+The search itself uses a compact 10-bit-per-row board and allocation-free
+recursion. For multi-game evaluation, keep `--search-threads 1` because the
+games already occupy the CPU cores. To benchmark one depth-3 game using the
+same root-level parallelism as the live bot, use:
+
+```powershell
+.\solver_eval.exe --games 1 --lookahead 3 --threads 1 --search-threads 0
+```
+
+For `--search-threads`, zero selects the available logical CPUs.
+
 ## Speed testing
 
-The bot is currently configured to search the current piece plus one queued
-piece. All rotation, movement, and hard-drop key-down/key-up events for a move
-are submitted in one `SendInput` batch with no artificial hold or settling
-delay. Capture polls at 1 ms intervals until the detected `NEXT` queue has
-actually advanced, then accepts that first updated frame. Each slot is sampled
-through its central vertical band so adjacent previews crossing slot boundaries
-during animation are ignored. A high-resolution Windows timer prevents short
-waits from being rounded to roughly 15 ms. The previous one-second loop delay
-has been removed.
+The bot defaults to the lookahead configured in `color.cpp`. It can be changed
+without recompiling, for example:
 
-After each move, the captured board is compared with the board predicted by the
-solver (excluding the active piece's spawn rows). A mismatch is printed
-immediately. Every mismatch is appended to `placement_mismatches.csv`, including
-the planned piece, position, rotation, queue, and expected and captured boards.
-The first five mismatch images are also saved with those choices in the
-filename (for example, `placement_mismatch_move_42_O_x2_r0_diff4.bmp`).
-The final benchmark summary reports mismatch counts and percentages separately
-for every tetromino type.
+```powershell
+.\color.exe --lookahead 2
+.\color.exe --lookahead 3
+```
+
+Depth 3 automatically evaluates root placements in parallel; shallower depths
+avoid thread-launch overhead. All rotation, movement, and hard-drop key-down/key-up events for a move
+are submitted in one `SendInput` batch. After every hard drop, the bot captures
+only the top portion of `NEXT` and requires the visible suffix of the preceding
+queue to shift by exactly one slot. It tracks the configured lookahead plus one
+extra synchronization slot (at least two slots total), so depth 1 reads two of
+the five previews, depth 2 reads three, and depth 3 reads four. The full queue
+is still captured at startup, and three or more slots are used for the one-time
+opening transition. This acknowledgement prevents the simulated bot from
+running ahead of the game without paying to copy and scan irrelevant previews.
+Empty, low-confidence, or impossible seven-bag readings are rejected. Each slot is sampled through its
+central vertical band so adjacent previews crossing slot boundaries during
+animation are ignored. A high-resolution Windows timer prevents short waits
+from being rounded to roughly 15 ms.
+
+The benchmark summary reports how often the board was resynchronized and how
+many resynchronizations corrected drift.
 
 Run without `--debug` when benchmarking. Each move reports fractional search
 time, full capture-to-capture cycle time, and instantaneous pieces per second.
@@ -125,7 +143,7 @@ The timing report separates:
 
 - Board preparation and solver search.
 - Placement input and the post-drop render wait.
-- Screen capture, grid decoding, and queue decoding.
+- Amortized queue capture, simulated board update, and queue decoding.
 - Total placing, looking, and full-cycle time.
 
 Stopping normally or encountering an invalid simulated placement prints sample

@@ -56,7 +56,7 @@ Start the game and hard-drop that piece at its default position and orientation.
 Because the board was empty, the bot constructs the resulting board directly,
 takes control with the second opening piece, and does not capture startup board
 graphics. Later states are simulated, while a periodic physical board audit can
-repair drift. Audits begin after a one-second warm-up and run every 25 moves;
+repair drift. Audits begin after a one-second warm-up and run every 200 moves;
 the bot keeps playing during the warm-up.
 
 ## Placement evaluation
@@ -118,18 +118,16 @@ without recompiling, for example:
 
 Depth 3 automatically evaluates root placements in parallel; shallower depths
 avoid thread-launch overhead. All rotation, movement, and hard-drop key-down/key-up events for a move
-are submitted in one `SendInput` batch. After every hard drop, the bot captures
-only the top portion of `NEXT` and requires the visible suffix of the preceding
-queue to shift by exactly one slot. It tracks the configured lookahead plus one
-extra synchronization slot (at least two slots total), so depth 1 reads two of
-the five previews, depth 2 reads three, and depth 3 reads four. The full queue
-is still captured at startup, and three or more slots are used for the one-time
-opening transition. This acknowledgement prevents the simulated bot from
-running ahead of the game without paying to copy and scan irrelevant previews.
-Empty, low-confidence, or impossible seven-bag readings are rejected. Each slot is sampled through its
-central vertical band so adjacent previews crossing slot boundaries during
-animation are ignored. A high-resolution Windows timer prevents short waits
-from being rounded to roughly 15 ms.
+are submitted in one `SendInput` batch. A physical capture reads the entire
+five-piece `NEXT` queue. With lookahead 1, the bot then consumes four pieces
+from that local queue before capturing it again; the fifth piece is retained as
+an overlap check. Higher lookahead values automatically shorten the batch when
+needed. At each refresh, the captured queue must be reliable, different from
+the preceding full capture, and begin with every locally known overlap piece.
+Empty, low-confidence, and inconsistent readings are retried instead of being
+accepted. A five-millisecond initial settle wait gives the final hard drop one
+200 Hz display interval to become visible, and a high-resolution Windows timer
+prevents short waits from being rounded to roughly 15 ms.
 
 The benchmark summary reports how often the board was resynchronized and how
 many resynchronizations corrected drift.

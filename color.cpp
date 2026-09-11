@@ -52,14 +52,15 @@ BITMAPINFO bmi;
 HBITMAP hBitmap;
 HANDLE highResolutionTimer;
 
-constexpr int queuedPiecesToLookAhead=0;
+constexpr int queuedPiecesToLookAhead=1;
 constexpr DWORD inputDelayMs=0;
 constexpr DWORD screenUpdateDelayMs=1;
 constexpr DWORD screenUpdateTimeoutMs=250;
+constexpr DWORD queueBatchSettleDelayMs=5;
 constexpr DWORD boardResyncWarmupMs=1000;
 constexpr int boardResyncIntervalMoves=200;
-constexpr DWORD inputPollingDelayMs=3;
-constexpr int statusPrintIntervalMoves=200;
+constexpr DWORD inputPollingDelayMs=2;
+constexpr int statusPrintIntervalMoves=25;
 constexpr int parallelSearchDepthThreshold=3;
 // Zero selects the machine's logical CPU count. The offline evaluator sets
 // this to one because it already parallelizes independent games.
@@ -69,10 +70,10 @@ int realMaxDepth=queuedPiecesToLookAhead;
 constexpr int boardColumns=10;
 constexpr int boardRows=20;
 constexpr int queueLength=5;
-// Normal play only needs the searched pieces plus one known overlapping slot
-// to acknowledge that NEXT advanced by exactly one piece. Inspection and the
-// opening capture still read the complete five-piece queue.
-int trackedQueueSlots=queueLength;
+// Keep at least one previously known piece as an overlap when NEXT is
+// refreshed. With lookahead 1, one full queue capture therefore supports four
+// hard drops before another physical capture is needed.
+int queueRefreshBatchSize=queueLength-1;
 constexpr int cellSampleRadius=1;
 constexpr int queuePixelStride=2;
 constexpr int queueSlotVerticalMarginDivisor=6;
@@ -350,12 +351,6 @@ void waitForKeyRelease(int virtualKey)
     }
 }
 
-void capture()
-{
-    BitBlt(hMemoryDC, 0, 0, width, height, hScreenDC, x, y, SRCCOPY);
-    // Pixel buffer is ready in pPixels (BGRA format)
-    pixels = (unsigned int*)pPixels;
-}
 void captureRegion(const ScreenRect& region)
 {
     BitBlt(
@@ -371,13 +366,13 @@ void captureRegion(const ScreenRect& region)
     );
     pixels=static_cast<unsigned int*>(pPixels);
 }
-void captureQueue(int slotCount=queueLength)
+void capture()
 {
-    slotCount=clamp(slotCount,1,queueLength);
-    ScreenRect capturedQueue=screenLayout.nextQueue;
-    capturedQueue.bottom=capturedQueue.top
-        +(screenLayout.nextQueue.height()*slotCount)/queueLength;
-    captureRegion(capturedQueue);
+    captureRegion({x,y,x+width,y+height});
+}
+void captureQueue()
+{
+    captureRegion(screenLayout.nextQueue);
 }
 void captureBoard()
 {
@@ -661,8 +656,7 @@ struct UpdatedFrame {
 };
 UpdatedFrame waitForQueueRefresh(
     const vector<Piece>& expectedPrefix,
-    const vector<Piece>& previousCapturedQueue,
-    int slotCount
+    const vector<Piece>& previousCapturedQueue
 )
 {
     UpdatedFrame result;
@@ -674,20 +668,24 @@ UpdatedFrame waitForQueueRefresh(
     while(true)
     {
         auto waitStart=chrono::steady_clock::now();
-        preciseWait(screenUpdateDelayMs);
+        preciseWait(
+            result.captureAttempts==0
+                ?queueBatchSettleDelayMs
+                :screenUpdateDelayMs
+        );
         result.renderWaitMs+=chrono::duration<double,milli>(
             chrono::steady_clock::now()-waitStart
         ).count();
 
         auto captureStart=chrono::steady_clock::now();
-        captureQueue(slotCount);
+        captureQueue();
         result.captureMs+=chrono::duration<double,milli>(
             chrono::steady_clock::now()-captureStart
         ).count();
         result.captureAttempts++;
 
         auto queueStart=chrono::steady_clock::now();
-        result.queue=getQueue(&result.queueColors,slotCount);
+        result.queue=getQueue(&result.queueColors);
         result.queueReadMs+=chrono::duration<double,milli>(
             chrono::steady_clock::now()-queueStart
         ).count();
@@ -695,9 +693,7 @@ UpdatedFrame waitForQueueRefresh(
         lastReadingReliable=isReliableQueueReading(
             result.queue,result.queueColors
         );
-        // Compare only the slots captured in this poll. The opening reference
-        // contains all five slots, while normal polls intentionally read less.
-        bool changed=!queueStartsWith(previousCapturedQueue,result.queue);
+        bool changed=!queuesHaveSameTypes(previousCapturedQueue,result.queue);
         if(lastReadingReliable
             && changed
             && queueStartsWith(result.queue,expectedPrefix))
@@ -1724,9 +1720,13 @@ int runBot(int argc,char* argv[]) {
             return 1;
         }
     }
-    trackedQueueSlots=min(queueLength,max(2,realMaxDepth+1));
+    queueRefreshBatchSize=min(
+        queueLength-1,
+        queueLength+1-realMaxDepth
+    );
     cout<<"Solver lookahead: "<<realMaxDepth<<" queued piece(s)\n"
-        <<"Tracked NEXT slots per move: "<<trackedQueueSlots<<endl;
+        <<"NEXT capture interval: every "<<queueRefreshBatchSize
+        <<" hard drop(s)"<<endl;
     string layoutError;
     const auto layoutPath=defaultScreenLayoutPath();
     if(!loadScreenLayout(layoutPath,screenLayout,layoutError))
@@ -1822,8 +1822,8 @@ int runBot(int argc,char* argv[]) {
         cleanupCapture();
         return 0;
     }
-    captureQueue(queueLength);
-    curQueue=getQueue(&queueColors,queueLength);
+    captureQueue();
+    curQueue=getQueue(&queueColors);
     if(!isReliableQueueReading(curQueue,queueColors))
     {
         throw runtime_error(
@@ -1846,11 +1846,7 @@ int runBot(int argc,char* argv[]) {
     vector<Piece>openingQueue=curQueue;
     // Three slots make the one-time opening transition unambiguous even when
     // the first two pieces happen to repeat across a seven-bag boundary.
-    int openingSynchronizationSlots=max(3,trackedQueueSlots);
-    size_t openingKnownSlots=min(
-        static_cast<size_t>(openingSynchronizationSlots),
-        openingQueue.size()-2
-    );
+    size_t openingKnownSlots=min<size_t>(3,openingQueue.size()-2);
     vector<Piece>expectedQueuePrefix(
         openingQueue.begin()+2,
         openingQueue.begin()+2+openingKnownSlots
@@ -1869,8 +1865,7 @@ int runBot(int argc,char* argv[]) {
     }
     UpdatedFrame firstUpdatedFrame=waitForQueueRefresh(
         expectedQueuePrefix,
-        openingQueue,
-        openingSynchronizationSlots
+        openingQueue
     );
     vector<vector<int>>openingBoard=predictBoardAfterPlacement(
         manuallyPlayedPiece,4,0
@@ -1880,6 +1875,8 @@ int runBot(int argc,char* argv[]) {
     curPiece=firstBotPiece;
     curQueue=move(firstUpdatedFrame.queue);
     queueColors=move(firstUpdatedFrame.queueColors);
+    vector<Piece>lastCapturedQueue=curQueue;
+    int movesSinceQueueCapture=0;
     if(debugMode)
     {
         printDebugSnapshot(
@@ -1978,20 +1975,39 @@ int runBot(int argc,char* argv[]) {
             throw runtime_error("The local NEXT queue ran out of pieces");
         }
         Piece nextActivePiece=curQueue.front();
-        vector<Piece>previousQueue=curQueue;
-        vector<Piece>expectedAdvancedPrefix(
-            previousQueue.begin()+1,previousQueue.end()
-        );
-        UpdatedFrame updatedFrame=waitForQueueRefresh(
-            expectedAdvancedPrefix,
-            previousQueue,
-            trackedQueueSlots
-        );
+        curQueue.erase(curQueue.begin());
+        if(!queueColors.empty()) queueColors.erase(queueColors.begin());
+        movesSinceQueueCapture++;
+
+        UpdatedFrame updatedFrame;
+        bool queueSynchronized=false;
+        if(movesSinceQueueCapture>=queueRefreshBatchSize)
+        {
+            vector<Piece>expectedQueuePrefix=curQueue;
+            updatedFrame=waitForQueueRefresh(
+                expectedQueuePrefix,
+                lastCapturedQueue
+            );
+            curQueue=move(updatedFrame.queue);
+            queueColors=move(updatedFrame.queueColors);
+            lastCapturedQueue=curQueue;
+            movesSinceQueueCapture=0;
+            queueSynchronized=true;
+            benchmarkStats.queueSynchronizationCount++;
+        }
+        else
+        {
+            // The old per-piece capture also gave TETR.IO time to spawn the
+            // next active piece. Keep that one-frame pacing without paying
+            // for a physical queue copy on intermediate moves.
+            auto renderWaitStart=chrono::steady_clock::now();
+            preciseWait(queueBatchSettleDelayMs);
+            updatedFrame.renderWaitMs=chrono::duration<double,milli>(
+                chrono::steady_clock::now()-renderWaitStart
+            ).count();
+        }
         curPiece=nextActivePiece;
-        curQueue=move(updatedFrame.queue);
-        queueColors=move(updatedFrame.queueColors);
         bool boardResynchronized=false;
-        benchmarkStats.queueSynchronizationCount++;
 
         auto timeSinceTakeover=chrono::duration_cast<chrono::milliseconds>(
             chrono::steady_clock::now()-takeoverStart
@@ -2074,7 +2090,7 @@ int runBot(int argc,char* argv[]) {
                 <<"  board update: "<<gridReadMs<<" ms"
                 <<"  queue: "<<queueReadMs<<" ms"
                 <<"  capture attempts: "<<updatedFrame.captureAttempts
-                <<"  queue synchronized: yes"
+                <<"  queue synchronized: "<<(queueSynchronized?"yes":"no")
                 <<"  board resynced: "<<(boardResynchronized?"yes":"no")<<"\n";
             cout<<"full cycle: "<<cycleMs<<" ms"
                 <<" ("<<(1000.0/cycleMs)<<" pieces/s)"<<endl;

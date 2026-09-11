@@ -1,4 +1,5 @@
 #include <windows.h>
+#include <dwmapi.h>
 #include <bits/stdc++.h>
 #include <chrono>
 #include <thread>
@@ -51,16 +52,20 @@ HDC hMemoryDC;
 BITMAPINFO bmi;
 HBITMAP hBitmap;
 HANDLE highResolutionTimer;
+HANDLE compositionFrameTimer;
+LARGE_INTEGER performanceCounterFrequency;
 
-constexpr int queuedPiecesToLookAhead=1;
+constexpr int queuedPiecesToLookAhead=0;
 constexpr DWORD inputDelayMs=0;
 constexpr DWORD screenUpdateDelayMs=1;
 constexpr DWORD screenUpdateTimeoutMs=250;
 constexpr DWORD queueBatchSettleDelayMs=5;
+constexpr double expectedFrameIntervalMs=5.0;
+constexpr double compositionFrameSafetyMarginMs=0.25;
 constexpr DWORD boardResyncWarmupMs=1000;
 constexpr int boardResyncIntervalMoves=200;
 constexpr DWORD inputPollingDelayMs=2;
-constexpr int statusPrintIntervalMoves=25;
+constexpr int statusPrintIntervalMoves=200;
 constexpr int parallelSearchDepthThreshold=3;
 // Zero selects the machine's logical CPU count. The offline evaluator sets
 // this to one because it already parallelizes independent games.
@@ -129,7 +134,24 @@ struct BenchmarkStats {
     TimingSeries lookingTotal;
     TimingSeries placingTotal;
     TimingSeries fullCycle;
+    TimingSeries localOnlyCycle;
+    TimingSeries queueSyncCycle;
+    TimingSeries queueSyncTotal;
+    TimingSeries queueInitialWait;
+    TimingSeries queueRetryWait;
+    TimingSeries queueCaptureWall;
+    TimingSeries queueCaptureCpu;
+    TimingSeries queueCaptureOffCpu;
+    TimingSeries queueDecodePhysical;
+    TimingSeries queueSyncOther;
+    TimingSeries compositionRefreshInterval;
     size_t queueSynchronizationCount=0;
+    size_t compositionClockSynchronizationCount=0;
+    size_t queueCaptureAttemptCount=0;
+    size_t unreliableQueueFrames=0;
+    size_t unchangedQueueFrames=0;
+    size_t overlapMismatchFrames=0;
+    size_t sevenBagMismatchFrames=0;
     size_t boardResyncCount=0;
     size_t boardDriftCorrectionCount=0;
     size_t correctedBoardCells=0;
@@ -249,11 +271,43 @@ struct BenchmarkStats {
         printSeries("Looking total",lookingTotal);
         printSeries("Placing total",placingTotal);
         printSeries("Full cycle",fullCycle);
+        printSeries("Local-only cycle",localOnlyCycle);
+        printSeries("Queue-sync cycle",queueSyncCycle);
         if(fullCycle.average()>0.0) {
             cout<<"Average throughput: "<<(1000.0/fullCycle.average())<<" pieces/s\n";
         }
         cout<<"Physical NEXT synchronizations: "
             <<queueSynchronizationCount<<'\n';
+        if(!queueSyncTotal.samples.empty()) {
+            cout<<"\nQueue synchronization detail (not amortized)\n";
+            cout<<left<<setw(22)<<"Stage"<<right
+                <<setw(10)<<"Samples"
+                <<setw(12)<<"Average"
+                <<setw(12)<<"Median"
+                <<setw(12)<<"P95"
+                <<setw(12)<<"Min"
+                <<setw(12)<<"Max"<<'\n';
+            printSeries("Synchronization total",queueSyncTotal);
+            printSeries("Initial settle wait",queueInitialWait);
+            printSeries("Retry waits",queueRetryWait);
+            printSeries("BitBlt wall",queueCaptureWall);
+            printSeries("BitBlt thread CPU",queueCaptureCpu);
+            printSeries("BitBlt off-CPU",queueCaptureOffCpu);
+            printSeries("Queue decode",queueDecodePhysical);
+            printSeries("Other sync overhead",queueSyncOther);
+            printSeries("DWM refresh interval",compositionRefreshInterval);
+            cout<<"Capture attempts per synchronization: "
+                <<static_cast<double>(queueCaptureAttemptCount)
+                    /queueSyncTotal.samples.size()<<'\n';
+            cout<<"Rejected queue frames: unreliable="
+                <<unreliableQueueFrames
+                <<", unchanged="<<unchangedQueueFrames
+                <<", overlap mismatch="<<overlapMismatchFrames
+                <<", seven-bag mismatch="<<sevenBagMismatchFrames<<'\n';
+            cout<<"DWM-clock synchronizations: "
+                <<compositionClockSynchronizationCount<<'/'
+                <<queueSynchronizationCount<<'\n';
+        }
         cout<<"Physical board resyncs: "<<boardResyncCount<<'\n';
         cout<<"Board drift corrections: "<<boardDriftCorrectionCount
             <<" ("<<correctedBoardCells<<" differing cells)\n";
@@ -343,6 +397,53 @@ void preciseWait(DWORD milliseconds)
     }
     Sleep(milliseconds);
 }
+bool armCompositionFrameTimer(int refreshCount,double& refreshIntervalMs)
+{
+    refreshIntervalMs=0;
+    if(!compositionFrameTimer || performanceCounterFrequency.QuadPart<=0
+        || refreshCount<=0)
+    {
+        return false;
+    }
+
+    DWM_TIMING_INFO timing{};
+    timing.cbSize=sizeof(timing);
+    if(FAILED(DwmGetCompositionTimingInfo(nullptr,&timing))
+        || timing.qpcRefreshPeriod==0)
+    {
+        return false;
+    }
+
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    refreshIntervalMs=
+        static_cast<double>(timing.qpcRefreshPeriod)*1000.0
+            /performanceCounterFrequency.QuadPart;
+    // Do not sample the queue while the target refresh is still being
+    // composed. A small post-boundary margin prevents a transitional queue
+    // from being accepted when adjacent queue pieces have the same type.
+    long double safetyTicksExact=
+        compositionFrameSafetyMarginMs
+            *performanceCounterFrequency.QuadPart/1000.0L;
+    ULONGLONG safetyTicks=
+        static_cast<ULONGLONG>(ceil(safetyTicksExact));
+    ULONGLONG targetRefreshQpc=timing.qpcVBlank
+        +static_cast<ULONGLONG>(refreshCount)*timing.qpcRefreshPeriod;
+    ULONGLONG targetQpc=targetRefreshQpc+safetyTicks;
+    if(targetQpc<=static_cast<ULONGLONG>(now.QuadPart)) return false;
+
+    long double remainingHundredNanoseconds=
+        static_cast<long double>(targetQpc-now.QuadPart)*10000000.0L
+            /performanceCounterFrequency.QuadPart;
+    LARGE_INTEGER dueTime{};
+    dueTime.QuadPart=-max<LONGLONG>(
+        1,
+        static_cast<LONGLONG>(ceil(remainingHundredNanoseconds))
+    );
+    return SetWaitableTimer(
+        compositionFrameTimer,&dueTime,0,nullptr,nullptr,FALSE
+    )!=FALSE;
+}
 void waitForKeyRelease(int virtualKey)
 {
     while(GetAsyncKeyState(virtualKey)&0x8000)
@@ -413,9 +514,26 @@ void init()
     {
         highResolutionTimer=CreateWaitableTimerW(nullptr,FALSE,nullptr);
     }
+    compositionFrameTimer=CreateWaitableTimerExW(
+        nullptr,
+        nullptr,
+        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+        TIMER_ALL_ACCESS
+    );
+    if(!compositionFrameTimer)
+    {
+        compositionFrameTimer=CreateWaitableTimerW(nullptr,FALSE,nullptr);
+    }
+    QueryPerformanceFrequency(&performanceCounterFrequency);
 }
 void cleanupCapture()
 {
+    if(compositionFrameTimer)
+    {
+        CancelWaitableTimer(compositionFrameTimer);
+        CloseHandle(compositionFrameTimer);
+        compositionFrameTimer=nullptr;
+    }
     if(highResolutionTimer)
     {
         CloseHandle(highResolutionTimer);
@@ -646,17 +764,100 @@ bool queuesHaveSameTypes(const vector<Piece>& first,const vector<Piece>& second)
     }
     return true;
 }
+bool isValidSevenBagPrefix(const vector<int>& sequence)
+{
+    for(size_t bagStart=0;bagStart<sequence.size();bagStart+=7)
+    {
+        array<bool,7>seen{};
+        size_t bagEnd=min(sequence.size(),bagStart+7);
+        for(size_t index=bagStart;index<bagEnd;index++)
+        {
+            int pieceIndex=sequence[index];
+            if(pieceIndex<0 || pieceIndex>=7 || seen[pieceIndex]) return false;
+            seen[pieceIndex]=true;
+        }
+    }
+    return true;
+}
+bool isValidQueueExtension(
+    const vector<int>& knownSequence,
+    const vector<Piece>& capturedQueue,
+    size_t overlapSize
+)
+{
+    if(overlapSize>capturedQueue.size()) return false;
+    vector<int>extendedSequence=knownSequence;
+    extendedSequence.reserve(
+        knownSequence.size()+capturedQueue.size()-overlapSize
+    );
+    for(size_t index=overlapSize;index<capturedQueue.size();index++)
+    {
+        extendedSequence.push_back(capturedQueue[index].ind);
+    }
+    return isValidSevenBagPrefix(extendedSequence);
+}
+void appendQueueExtension(
+    vector<int>& knownSequence,
+    const vector<Piece>& capturedQueue,
+    size_t overlapSize
+)
+{
+    for(size_t index=overlapSize;index<capturedQueue.size();index++)
+    {
+        knownSequence.push_back(capturedQueue[index].ind);
+    }
+}
 struct UpdatedFrame {
     vector<Piece> queue;
     vector<color> queueColors;
     double renderWaitMs=0;
     double captureMs=0;
     double queueReadMs=0;
+    double initialWaitMs=0;
+    double retryWaitMs=0;
+    double captureCpuMs=0;
+    double captureOffCpuMs=0;
+    double synchronizationMs=0;
+    double otherSynchronizationMs=0;
+    bool captureCpuMeasured=false;
     int captureAttempts=0;
+    int unreliableFrames=0;
+    int unchangedFrames=0;
+    int overlapMismatchFrames=0;
+    int sevenBagMismatchFrames=0;
 };
+
+double currentThreadCpuMilliseconds()
+{
+    FILETIME creationTime{};
+    FILETIME exitTime{};
+    FILETIME kernelTime{};
+    FILETIME userTime{};
+    if(!GetThreadTimes(
+        GetCurrentThread(),
+        &creationTime,
+        &exitTime,
+        &kernelTime,
+        &userTime
+    ))
+    {
+        return numeric_limits<double>::quiet_NaN();
+    }
+    ULARGE_INTEGER kernel{};
+    kernel.LowPart=kernelTime.dwLowDateTime;
+    kernel.HighPart=kernelTime.dwHighDateTime;
+    ULARGE_INTEGER user{};
+    user.LowPart=userTime.dwLowDateTime;
+    user.HighPart=userTime.dwHighDateTime;
+    return static_cast<double>(kernel.QuadPart+user.QuadPart)/10000.0;
+}
+
 UpdatedFrame waitForQueueRefresh(
     const vector<Piece>& expectedPrefix,
-    const vector<Piece>& previousCapturedQueue
+    const vector<Piece>& previousCapturedQueue,
+    const vector<int>& knownSequence,
+    DWORD initialWaitMilliseconds=queueBatchSettleDelayMs,
+    bool waitForCompositionFrame=false
 )
 {
     UpdatedFrame result;
@@ -668,20 +869,49 @@ UpdatedFrame waitForQueueRefresh(
     while(true)
     {
         auto waitStart=chrono::steady_clock::now();
-        preciseWait(
-            result.captureAttempts==0
-                ?queueBatchSettleDelayMs
-                :screenUpdateDelayMs
-        );
-        result.renderWaitMs+=chrono::duration<double,milli>(
+        if(result.captureAttempts==0 && waitForCompositionFrame)
+        {
+            DWORD waitResult=WaitForSingleObject(
+                compositionFrameTimer,
+                screenUpdateTimeoutMs
+            );
+            if(waitResult!=WAIT_OBJECT_0)
+            {
+                throw runtime_error(
+                    "DWM composition-frame timer did not signal"
+                );
+            }
+        }
+        else
+        {
+            preciseWait(
+                result.captureAttempts==0
+                    ?initialWaitMilliseconds
+                    :screenUpdateDelayMs
+            );
+        }
+        double waitMs=chrono::duration<double,milli>(
             chrono::steady_clock::now()-waitStart
         ).count();
+        result.renderWaitMs+=waitMs;
+        if(result.captureAttempts==0) result.initialWaitMs+=waitMs;
+        else result.retryWaitMs+=waitMs;
 
+        double captureCpuStart=currentThreadCpuMilliseconds();
         auto captureStart=chrono::steady_clock::now();
         captureQueue();
-        result.captureMs+=chrono::duration<double,milli>(
+        double captureWallMs=chrono::duration<double,milli>(
             chrono::steady_clock::now()-captureStart
         ).count();
+        double captureCpuEnd=currentThreadCpuMilliseconds();
+        result.captureMs+=captureWallMs;
+        if(isfinite(captureCpuStart) && isfinite(captureCpuEnd))
+        {
+            double captureCpuMs=max(0.0,captureCpuEnd-captureCpuStart);
+            result.captureCpuMs+=captureCpuMs;
+            result.captureOffCpuMs+=max(0.0,captureWallMs-captureCpuMs);
+            result.captureCpuMeasured=true;
+        }
         result.captureAttempts++;
 
         auto queueStart=chrono::steady_clock::now();
@@ -694,13 +924,29 @@ UpdatedFrame waitForQueueRefresh(
             result.queue,result.queueColors
         );
         bool changed=!queuesHaveSameTypes(previousCapturedQueue,result.queue);
-        if(lastReadingReliable
-            && changed
-            && queueStartsWith(result.queue,expectedPrefix))
+        bool validBagExtension=isValidQueueExtension(
+            knownSequence,
+            result.queue,
+            expectedPrefix.size()
+        );
+        bool overlapMatches=queueStartsWith(result.queue,expectedPrefix);
+        if(lastReadingReliable && changed && overlapMatches && validBagExtension)
         {
+            result.synchronizationMs=chrono::duration<double,milli>(
+                chrono::steady_clock::now()-synchronizationStart
+            ).count();
+            result.otherSynchronizationMs=max(
+                0.0,
+                result.synchronizationMs-result.renderWaitMs
+                    -result.captureMs-result.queueReadMs
+            );
             benchmarkStats.activeStage.clear();
             return result;
         }
+        if(!lastReadingReliable) result.unreliableFrames++;
+        else if(!changed) result.unchangedFrames++;
+        else if(!overlapMatches) result.overlapMismatchFrames++;
+        else result.sevenBagMismatchFrames++;
 
         double elapsed=chrono::duration<double,milli>(
             chrono::steady_clock::now()-synchronizationStart
@@ -712,7 +958,14 @@ UpdatedFrame waitForQueueRefresh(
                  <<" ms; expected prefix="<<getQueueTypes(expectedPrefix)
                  <<", previous capture="<<getQueueTypes(previousCapturedQueue)
                  <<", last seen="<<getQueueTypes(result.queue)
-                 <<", reliable="<<(lastReadingReliable?"yes":"no");
+                 <<", reliable="<<(lastReadingReliable?"yes":"no")
+                 <<", seven-bag extension="
+                 <<(validBagExtension?"yes":"no")
+                 <<", rejected frames: unreliable="
+                 <<result.unreliableFrames
+                 <<", unchanged="<<result.unchangedFrames
+                 <<", overlap mismatch="<<result.overlapMismatchFrames
+                 <<", seven-bag mismatch="<<result.sevenBagMismatchFrames;
             throw runtime_error(error.str());
         }
     }
@@ -1830,6 +2083,15 @@ int runBot(int argc,char* argv[]) {
             "The opening queue capture is incomplete or has unreliable colors"
         );
     }
+    vector<int>knownPieceSequence;
+    knownPieceSequence.reserve(queueLength);
+    for(const Piece& piece:curQueue) knownPieceSequence.push_back(piece.ind);
+    if(!isValidSevenBagPrefix(knownPieceSequence))
+    {
+        throw runtime_error(
+            "The opening queue is not a valid prefix of a fresh seven-bag"
+        );
+    }
     if(debugMode)
     {
         printDebugSnapshot(
@@ -1865,7 +2127,13 @@ int runBot(int argc,char* argv[]) {
     }
     UpdatedFrame firstUpdatedFrame=waitForQueueRefresh(
         expectedQueuePrefix,
-        openingQueue
+        openingQueue,
+        knownPieceSequence
+    );
+    appendQueueExtension(
+        knownPieceSequence,
+        firstUpdatedFrame.queue,
+        expectedQueuePrefix.size()
     );
     vector<vector<int>>openingBoard=predictBoardAfterPlacement(
         manuallyPlayedPiece,4,0
@@ -1877,6 +2145,9 @@ int runBot(int argc,char* argv[]) {
     queueColors=move(firstUpdatedFrame.queueColors);
     vector<Piece>lastCapturedQueue=curQueue;
     int movesSinceQueueCapture=0;
+    chrono::steady_clock::time_point firstInputInBatch;
+    bool compositionFrameTimerArmed=false;
+    double batchCompositionRefreshIntervalMs=0;
     if(debugMode)
     {
         printDebugSnapshot(
@@ -1962,6 +2233,14 @@ int runBot(int argc,char* argv[]) {
         benchmarkStats.beginStage("placement input");
         size_t keyPressCount=actuallyPutThePiece(best_play[0],best_play[1]);
         double placementInputMs=benchmarkStats.finishStage(benchmarkStats.placementInput);
+        if(movesSinceQueueCapture==0)
+        {
+            firstInputInBatch=chrono::steady_clock::now();
+            compositionFrameTimerArmed=armCompositionFrameTimer(
+                max(1,queueRefreshBatchSize-1),
+                batchCompositionRefreshIntervalMs
+            );
+        }
 
         auto boardUpdateStart=chrono::steady_clock::now();
         grid=move(predictedBoard);
@@ -1984,9 +2263,30 @@ int runBot(int argc,char* argv[]) {
         if(movesSinceQueueCapture>=queueRefreshBatchSize)
         {
             vector<Piece>expectedQueuePrefix=curQueue;
+            DWORD scheduledWaitMs=0;
+            if(!compositionFrameTimerArmed)
+            {
+                double elapsedSinceFirstInput=chrono::duration<double,milli>(
+                    chrono::steady_clock::now()-firstInputInBatch
+                ).count();
+                double desiredCaptureStartMs=
+                    (queueRefreshBatchSize-1)*expectedFrameIntervalMs;
+                scheduledWaitMs=static_cast<DWORD>(ceil(max(
+                    0.0,
+                    desiredCaptureStartMs-elapsedSinceFirstInput
+                )));
+            }
             updatedFrame=waitForQueueRefresh(
                 expectedQueuePrefix,
-                lastCapturedQueue
+                lastCapturedQueue,
+                knownPieceSequence,
+                scheduledWaitMs,
+                compositionFrameTimerArmed
+            );
+            appendQueueExtension(
+                knownPieceSequence,
+                updatedFrame.queue,
+                expectedQueuePrefix.size()
             );
             curQueue=move(updatedFrame.queue);
             queueColors=move(updatedFrame.queueColors);
@@ -1994,14 +2294,59 @@ int runBot(int argc,char* argv[]) {
             movesSinceQueueCapture=0;
             queueSynchronized=true;
             benchmarkStats.queueSynchronizationCount++;
+            if(compositionFrameTimerArmed)
+            {
+                benchmarkStats.compositionClockSynchronizationCount++;
+                benchmarkStats.compositionRefreshInterval.add(
+                    batchCompositionRefreshIntervalMs
+                );
+            }
+            compositionFrameTimerArmed=false;
+            benchmarkStats.queueCaptureAttemptCount+=
+                updatedFrame.captureAttempts;
+            benchmarkStats.unreliableQueueFrames+=
+                updatedFrame.unreliableFrames;
+            benchmarkStats.unchangedQueueFrames+=
+                updatedFrame.unchangedFrames;
+            benchmarkStats.overlapMismatchFrames+=
+                updatedFrame.overlapMismatchFrames;
+            benchmarkStats.sevenBagMismatchFrames+=
+                updatedFrame.sevenBagMismatchFrames;
+            benchmarkStats.queueSyncTotal.add(
+                updatedFrame.synchronizationMs
+            );
+            benchmarkStats.queueInitialWait.add(
+                updatedFrame.initialWaitMs
+            );
+            benchmarkStats.queueRetryWait.add(
+                updatedFrame.retryWaitMs
+            );
+            benchmarkStats.queueCaptureWall.add(
+                updatedFrame.captureMs
+            );
+            if(updatedFrame.captureCpuMeasured)
+            {
+                benchmarkStats.queueCaptureCpu.add(
+                    updatedFrame.captureCpuMs
+                );
+                benchmarkStats.queueCaptureOffCpu.add(
+                    updatedFrame.captureOffCpuMs
+                );
+            }
+            benchmarkStats.queueDecodePhysical.add(
+                updatedFrame.queueReadMs
+            );
+            benchmarkStats.queueSyncOther.add(
+                updatedFrame.otherSynchronizationMs
+            );
         }
         else
         {
-            // The old per-piece capture also gave TETR.IO time to spawn the
-            // next active piece. Keep that one-frame pacing without paying
-            // for a physical queue copy on intermediate moves.
+            // Let TETR.IO's input thread run without waiting for a rendered
+            // frame. The full five-millisecond settle is only needed before
+            // a physical queue refresh at the end of the batch.
             auto renderWaitStart=chrono::steady_clock::now();
-            preciseWait(queueBatchSettleDelayMs);
+            Sleep(0);
             updatedFrame.renderWaitMs=chrono::duration<double,milli>(
                 chrono::steady_clock::now()-renderWaitStart
             ).count();
@@ -2071,6 +2416,8 @@ int runBot(int argc,char* argv[]) {
             std::chrono::steady_clock::now()-cycleStart
         ).count();
         benchmarkStats.fullCycle.add(cycleMs);
+        if(queueSynchronized) benchmarkStats.queueSyncCycle.add(cycleMs);
+        else benchmarkStats.localOnlyCycle.add(cycleMs);
         bool printMoveStatus=debugMode || moveNumber==1
             || moveNumber%statusPrintIntervalMoves==0;
         if(printMoveStatus)

@@ -6,8 +6,8 @@ Build the calibration tool and the bot with MinGW-w64:
 
 ```powershell
 g++ -std=c++17 -O2 calibrate.cpp -o calibrate.exe -lgdi32
-g++ -std=c++17 -O2 color.cpp -o color.exe -lgdi32
-g++ -std=c++17 -O2 solver_eval.cpp -o solver_eval.exe -lgdi32
+g++ -std=c++17 -O2 color.cpp -o color.exe -ldwmapi -lgdi32
+g++ -std=c++17 -O2 solver_eval.cpp -o solver_eval.exe -ldwmapi -lgdi32
 ```
 
 The default VS Code build task uses these compiler and linker settings for the
@@ -123,11 +123,18 @@ five-piece `NEXT` queue. With lookahead 1, the bot then consumes four pieces
 from that local queue before capturing it again; the fifth piece is retained as
 an overlap check. Higher lookahead values automatically shorten the batch when
 needed. At each refresh, the captured queue must be reliable, different from
-the preceding full capture, and begin with every locally known overlap piece.
+the preceding full capture, begin with every locally known overlap piece, and
+remain consistent with the accumulated seven-bag sequence.
 Empty, low-confidence, and inconsistent readings are retried instead of being
-accepted. A five-millisecond initial settle wait gives the final hard drop one
-200 Hz display interval to become visible, and a high-resolution Windows timer
-prevents short waits from being rounded to roughly 15 ms.
+accepted. Intermediate hard drops only yield the scheduler so TETR.IO can
+consume their input events; they do not wait for rendered frames. At a queue
+boundary, the bot reads the DWM composition clock and arms a high-resolution
+timer for just after the final display refresh expected by the batch. The timer
+runs while the remaining moves are searched and placed. A small post-refresh
+margin prevents a partially updated queue from being accepted. If composition
+timing is unavailable, the bot falls back to the fixed five-millisecond refresh
+estimate. The usual reliability and overlap checks still trigger retries when
+the game renders later than predicted.
 
 The benchmark summary reports how often the board was resynchronized and how
 many resynchronizations corrected drift.
@@ -145,6 +152,10 @@ The timing report separates:
 - Placement input and the post-drop render wait.
 - Amortized queue capture, simulated board update, and queue decoding.
 - Total placing, looking, and full-cycle time.
+- Local-only cycles versus the more expensive queue-synchronization cycles.
+- Non-amortized queue synchronization, including initial and retry waits,
+  `BitBlt` wall time, thread CPU time, inferred off-CPU time, decoding, and
+  otherwise unaccounted synchronization overhead.
 
 Stopping normally or encountering an invalid simulated placement prints sample
 count, average, median, 95th percentile, minimum, and maximum for every stage.
